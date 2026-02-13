@@ -13,12 +13,15 @@ const { Readable } = require("stream");
 const app = express();
 const upload = multer({ dest: "uploads/" });
 
-// Crash olsa bile log’a düşsün (Runtime Logs’ta göreceksin)
+// Runtime Logs’ta crash gözüksün
 process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
 
+// ---- HEALTH ----
 app.get("/", (req, res) => res.status(200).send("OK"));
 app.get("/health", (req, res) => res.json({ ok: true }));
+// Railway health-check yanlış ayarlıysa diye alias:
+app.get("/render10min/health", (req, res) => res.json({ ok: true, alias: true }));
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -225,7 +228,6 @@ app.post("/render10min/start", upload.fields([{ name: "image", maxCount: 1 }]), 
 
     jobs.set(jobId, { status: "processing", dir, output: null, error: null, createdAt: Date.now() });
 
-    // async başlat
     runRender10MinJob(jobId, plan, imagePath, dir);
 
     return res.json({ jobId, status: "processing" });
@@ -253,10 +255,10 @@ app.get("/render10min/result/:id", (req, res) => {
   });
 });
 
-// Yanlış endpoint çağrılarını yakala
 app.post("/render10min", (req, res) => {
   return res.status(410).json({ error: "Use POST /render10min/start then poll /status and /result" });
 });
 
 const PORT = process.env.PORT || 3000;
+console.log("Booting... env.PORT =", process.env.PORT, "=> listening on", PORT);
 app.listen(PORT, "0.0.0.0", () => console.log("server running on", PORT));
