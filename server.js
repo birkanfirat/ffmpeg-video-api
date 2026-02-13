@@ -6,83 +6,91 @@ const fs = require("fs");
 const app = express();
 const upload = multer({ dest: "uploads/" });
 
-function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
+function clamp(n, a, b) {
+  return Math.max(a, Math.min(b, n));
+}
 
-// keyframe'ler arası lineer interpolasyon yapan zoom if zinciri üretir
-function buildZoomExpr(frames, fps) {
-  // Kaç segment olsun? (3-6 arası)
-  const segments = Math.floor(Math.random() * 4) + 3;
+// Çok yavaş ve hafif zoom üreten fonksiyon
+function buildZoomExpr(frames) {
+  // Sadece 2–3 segment (çok yön değişmesin)
+  const segments = Math.floor(Math.random() * 2) + 2;
 
-  // Zoom aralığı: çok agresif olmasın
   const zMin = 1.0;
-  const zMax = 1.14;
+  const zMax = 1.03; // çok hafif zoom
 
-  // Keyframe frame indexleri (0..frames)
   const points = [0];
   for (let i = 1; i < segments; i++) {
     points.push(Math.floor((frames * i) / segments));
   }
   points.push(frames);
 
-  // Zoom değerleri (smooth)
-  // İlk değer 1.0 yakınında başlasın
-  const zooms = [1.0 + Math.random() * 0.03];
+  // Başlangıç zoomu çok sabit
+  const zooms = [1.0 + Math.random() * 0.01];
+
   for (let i = 1; i < points.length; i++) {
-    // Bir önceki değerden çok kopmasın diye küçük adımlarla gezdiriyoruz
     const prev = zooms[i - 1];
-    const delta = (Math.random() * 0.08) - 0.04; // -0.04..+0.04
+
+    // çok küçük değişim
+    const delta = (Math.random() * 0.02) - 0.01;
     const next = clamp(prev + delta, zMin, zMax);
+
     zooms.push(next);
   }
 
-  // FFmpeg zoompan 'z=' if zinciri:
-  // if(between(on,p0,p1), z0 + (z1-z0)*(on-p0)/(p1-p0), ... )
   let expr = "";
   for (let i = 0; i < points.length - 1; i++) {
     const p0 = points[i];
     const p1 = points[i + 1];
     const z0 = zooms[i].toFixed(4);
     const z1 = zooms[i + 1].toFixed(4);
-    const seg = `if(between(on\\,${p0}\\,${p1})\\,(${z0})+(${z1}-${z0})*((on-${p0})/(${Math.max(1, p1 - p0)}))\\,`;
+
+    const seg =
+      `if(between(on\\,${p0}\\,${p1})\\,` +
+      `(${z0})+(${z1}-${z0})*((on-${p0})/(${Math.max(1, p1 - p0)}))\\,`;
+
     expr += seg;
   }
-  // fallback son değer
-  expr += `${zooms[zooms.length - 1].toFixed(4)}` + ")".repeat(points.length - 1);
 
+  expr += zooms[zooms.length - 1].toFixed(4) + ")".repeat(points.length - 1);
   return expr;
 }
 
 app.post("/render", upload.fields([{ name: "image" }, { name: "audio" }]), (req, res) => {
   try {
     if (!req.files?.image?.[0] || !req.files?.audio?.[0]) {
-      return res.status(400).json({ error: "Missing required files", got: Object.keys(req.files || {}) });
+      return res.status(400).json({
+        error: "Missing required files",
+        got: Object.keys(req.files || {})
+      });
     }
 
     const image = req.files.image[0].path;
     const audio = req.files.audio[0].path;
     const output = "output.mp4";
 
-    // Audio süresini al (saniye)
+    // Audio süresini öğren
     const probeCmd = `ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "${audio}"`;
 
     exec(probeCmd, (probeErr, probeStdout) => {
       if (probeErr) {
-        return res.status(500).json({ error: "ffprobe failed", details: String(probeErr) });
+        return res.status(500).json({
+          error: "ffprobe failed",
+          details: String(probeErr)
+        });
       }
 
-      const durationSec = Math.max(1, Math.floor(parseFloat(String(probeStdout).trim()) || 60));
-      const fps = 25;
+      const durationSec = Math.max(
+        1,
+        Math.floor(parseFloat(String(probeStdout).trim()) || 60)
+      );
 
-      // CPU/RAM rahatlatmak için sabit çözünürlük
+      const fps = 20; // daha sakin hareket
       const outW = 1280;
       const outH = 720;
 
       const totalFrames = durationSec * fps;
+      const zoomExpr = buildZoomExpr(totalFrames);
 
-      // Rastgele ama smooth zoom ifadesi
-      const zoomExpr = buildZoomExpr(totalFrames, fps);
-
-      // Zoom merkezini ortada tut (x,y)
       const xExpr = `(iw/2)-(iw/zoom/2)`;
       const yExpr = `(ih/2)-(ih/zoom/2)`;
 
@@ -116,7 +124,10 @@ app.post("/render", upload.fields([{ name: "image" }, { name: "audio" }]), (req,
       });
     });
   } catch (e) {
-    return res.status(500).json({ error: "server error", message: String(e) });
+    return res.status(500).json({
+      error: "server error",
+      message: String(e)
+    });
   }
 });
 
