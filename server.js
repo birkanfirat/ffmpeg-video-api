@@ -9,7 +9,10 @@ const upload = multer({ dest: "uploads/" });
 app.post("/render", upload.fields([{ name: "image" }, { name: "audio" }]), (req, res) => {
   try {
     if (!req.files?.image?.[0] || !req.files?.audio?.[0]) {
-      return res.status(400).json({ error: "Missing required files", got: Object.keys(req.files || {}) });
+      return res.status(400).json({
+        error: "Missing required files",
+        got: Object.keys(req.files || {})
+      });
     }
 
     const image = req.files.image[0].path;
@@ -19,33 +22,39 @@ app.post("/render", upload.fields([{ name: "image" }, { name: "audio" }]), (req,
     const probeCmd = `ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "${audio}"`;
 
     exec(probeCmd, (probeErr, probeStdout) => {
-      if (probeErr) return res.status(500).json({ error: "ffprobe failed", details: String(probeErr) });
+      if (probeErr) {
+        return res.status(500).json({ error: "ffprobe failed", details: String(probeErr) });
+      }
 
       const durationSec = Math.max(1, Math.floor(parseFloat(String(probeStdout).trim()) || 60));
 
+      // Ayarlar
       const fps = 25;
 
+      // Çıkış video (1080p)
       const outW = 1920;
       const outH = 1080;
 
+      // Zoom sırasında daha iyi kalite için daha büyük base canvas
       const baseW = 2400;
       const baseH = 1350;
 
+      // Sadece sabit hızda zoom-in
       const zStart = 1.0;
       const zEnd = 1.06;
 
       const totalFrames = durationSec * fps;
-
       const zoomExpr = `${zStart}+(${zEnd}-${zStart})*(on/${Math.max(1, totalFrames)})`;
 
-      // Merkezde kalsın ama TAM SAYI olsun → jitter gider
-      const xExpr = `floor((iw/2)-(iw/zoom/2))`;
-      const yExpr = `floor((ih/2)-(ih/zoom/2))`;
+      // Titreme yapmaması için floor() KULLANMIYORUZ (float merkez)
+      const xExpr = `(iw - iw/zoom)/2`;
+      const yExpr = `(ih - ih/zoom)/2`;
 
       const cmd =
-        `ffmpeg -y -loop 1 -i "${image}" -i "${audio}" ` +
+        `ffmpeg -y -sws_flags lanczos+accurate_rnd -loop 1 -i "${image}" -i "${audio}" ` +
         `-filter_complex "` +
-        `[0:v]scale=${baseW}:${baseH}:force_original_aspect_ratio=increase,crop=${baseW}:${baseH},` +
+        `[0:v]scale=${baseW}:${baseH}:force_original_aspect_ratio=increase:flags=lanczos,` +
+        `crop=${baseW}:${baseH},` +
         `zoompan=z='${zoomExpr}':x='${xExpr}':y='${yExpr}':d=1:s=${outW}x${outH}:fps=${fps}[v]` +
         `" ` +
         `-map "[v]" -map 1:a ` +
@@ -60,7 +69,7 @@ app.post("/render", upload.fields([{ name: "image" }, { name: "audio" }]), (req,
             code: err.code,
             signal: err.signal,
             cmd,
-            stderr: (stderr || "").slice(-4000),
+            stderr: (stderr || "").slice(-4000)
           });
         }
 
