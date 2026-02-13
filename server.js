@@ -17,11 +17,11 @@ app.post("/render", upload.fields([
 
   const cmd = `
 ffmpeg -loop 1 -i ${image} -i ${audio} \
--c:v libx264 -tune stillimage \
--c:a aac -b:a 192k \
--pix_fmt yuv420p \
--shortest ${output}
-`;
+-filter_complex "[0:v]scale=1280:-2,zoompan=z='min(zoom+0.0005,1.15)':d=125:s=1280x720:fps=25[v]" \
+-map "[v]" -map 1:a \
+-c:v libx264 -preset veryfast -crf 30 \
+-c:a aac -b:a 128k \
+-shortest -pix_fmt yuv420p -movflags +faststart output.mp4`;
 
   exec(cmd, (err) => {
     if (err) return res.status(500).send(err);
