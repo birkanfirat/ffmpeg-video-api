@@ -11,7 +11,7 @@ app.post("/render", upload.fields([{ name: "image" }, { name: "audio" }]), (req,
     if (!req.files?.image?.[0] || !req.files?.audio?.[0]) {
       return res.status(400).json({
         error: "Missing required files",
-        got: Object.keys(req.files || {})
+        got: Object.keys(req.files || {}),
       });
     }
 
@@ -28,25 +28,22 @@ app.post("/render", upload.fields([{ name: "image" }, { name: "audio" }]), (req,
 
       const durationSec = Math.max(1, Math.floor(parseFloat(String(probeStdout).trim()) || 60));
 
-      // Ayarlar
-      const fps = 25;
+      // Railway Free için hafif ayarlar
+      const fps = 20;
+      const outW = 1280;
+      const outH = 720;
 
-      // Çıkış video (1080p)
-      const outW = 1920;
-      const outH = 1080;
+      // Zoom için biraz daha büyük base
+      const baseW = 1600;
+      const baseH = 900;
 
-      // Zoom sırasında daha iyi kalite için daha büyük base canvas
-      const baseW = 2400;
-      const baseH = 1350;
-
-      // Sadece sabit hızda zoom-in
       const zStart = 1.0;
-      const zEnd = 1.06;
+      const zEnd = 1.05;
 
       const totalFrames = durationSec * fps;
       const zoomExpr = `${zStart}+(${zEnd}-${zStart})*(on/${Math.max(1, totalFrames)})`;
 
-      // Titreme yapmaması için floor() KULLANMIYORUZ (float merkez)
+      // Titreme azaltmak için float merkez (floor yok)
       const xExpr = `(iw - iw/zoom)/2`;
       const yExpr = `(ih - ih/zoom)/2`;
 
@@ -58,7 +55,7 @@ app.post("/render", upload.fields([{ name: "image" }, { name: "audio" }]), (req,
         `zoompan=z='${zoomExpr}':x='${xExpr}':y='${yExpr}':d=1:s=${outW}x${outH}:fps=${fps}[v]` +
         `" ` +
         `-map "[v]" -map 1:a ` +
-        `-c:v libx264 -preset veryfast -crf 30 ` +
+        `-c:v libx264 -preset veryfast -crf 28 ` +
         `-c:a aac -b:a 128k -ac 2 -ar 44100 ` +
         `-shortest -pix_fmt yuv420p -movflags +faststart "${output}"`;
 
@@ -69,7 +66,7 @@ app.post("/render", upload.fields([{ name: "image" }, { name: "audio" }]), (req,
             code: err.code,
             signal: err.signal,
             cmd,
-            stderr: (stderr || "").slice(-4000)
+            stderr: (stderr || "").slice(-4000),
           });
         }
 
