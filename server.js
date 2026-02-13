@@ -6,56 +6,27 @@ const fs = require("fs");
 const app = express();
 const upload = multer({ dest: "uploads/" });
 
-app.post("/render", upload.fields([{ name: "image" }, { name: "audio" }]), (req, res) => {
-  try {
-    if (!req.files?.image?.[0] || !req.files?.audio?.[0]) {
-      return res.status(400).json({
-        error: "Missing required files",
-        got: Object.keys(req.files || {}),
-      });
-    }
-
-    const image = req.files.image[0].path;
-    const audio = req.files.audio[0].path;
-    const output = "output.mp4";
-
-    const probeCmd = `ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "${audio}"`;
-
-    exec(probeCmd, (probeErr, probeStdout) => {
-      if (probeErr) {
-        return res.status(500).json({ error: "ffprobe failed", details: String(probeErr) });
+app.post(
+  "/render",
+  upload.fields([{ name: "image" }, { name: "audio" }]),
+  (req, res) => {
+    try {
+      if (!req.files?.image?.[0] || !req.files?.audio?.[0]) {
+        return res.status(400).json({
+          error: "Missing required files",
+          got: Object.keys(req.files || {})
+        });
       }
 
-      const durationSec = Math.max(1, Math.floor(parseFloat(String(probeStdout).trim()) || 60));
-
-      // Railway Free için hafif ayarlar
-      const fps = 20;
-      const outW = 1280;
-      const outH = 720;
-
-      // Zoom için biraz daha büyük base
-      const baseW = 1600;
-      const baseH = 900;
-
-      const zStart = 1.0;
-      const zEnd = 1.05;
-
-      const totalFrames = durationSec * fps;
-      const zoomExpr = `${zStart}+(${zEnd}-${zStart})*(on/${Math.max(1, totalFrames)})`;
-
-      // Titreme azaltmak için float merkez (floor yok)
-      const xExpr = `(iw - iw/zoom)/2`;
-      const yExpr = `(ih - ih/zoom)/2`;
+      const image = req.files.image[0].path;
+      const audio = req.files.audio[0].path;
+      const output = "output.mp4";
 
       const cmd =
-        `ffmpeg -y -sws_flags lanczos+accurate_rnd -loop 1 -i "${image}" -i "${audio}" ` +
-        `-filter_complex "` +
-        `[0:v]scale=${baseW}:${baseH}:force_original_aspect_ratio=increase:flags=lanczos,` +
-        `crop=${baseW}:${baseH},` +
-        `zoompan=z='${zoomExpr}':x='${xExpr}':y='${yExpr}':d=1:s=${outW}x${outH}:fps=${fps}[v]` +
-        `" ` +
+        `ffmpeg -y -loop 1 -i "${image}" -i "${audio}" ` +
+        `-filter_complex "[0:v]scale=1280:-2,zoompan=z='min(zoom+0.0005,1.15)':d=125:s=1280x720:fps=25[v]" ` +
         `-map "[v]" -map 1:a ` +
-        `-c:v libx264 -preset veryfast -crf 28 ` +
+        `-c:v libx264 -preset veryfast -crf 30 ` +
         `-c:a aac -b:a 128k -ac 2 -ar 44100 ` +
         `-shortest -pix_fmt yuv420p -movflags +faststart "${output}"`;
 
@@ -65,8 +36,7 @@ app.post("/render", upload.fields([{ name: "image" }, { name: "audio" }]), (req,
             error: "ffmpeg failed",
             code: err.code,
             signal: err.signal,
-            cmd,
-            stderr: (stderr || "").slice(-4000),
+            stderr: (stderr || "").slice(-4000)
           });
         }
 
@@ -76,11 +46,10 @@ app.post("/render", upload.fields([{ name: "image" }, { name: "audio" }]), (req,
           try { fs.unlinkSync(output); } catch {}
         });
       });
-    });
-  } catch (e) {
-    return res.status(500).json({ error: "server error", message: String(e) });
+    } catch (e) {
+      return res.status(500).json({ error: "server error", message: String(e) });
+    }
   }
-});
+);
 
 app.listen(3000, () => console.log("server running"));
- 
