@@ -4,60 +4,74 @@ const { exec } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const crypto = require("crypto");
-const unzipper = require("unzipper");
+const axios = require("axios");
 
 const app = express();
 const upload = multer({ dest: "uploads/" });
 
-function safeUnlink(p) {
-  try { fs.unlinkSync(p); } catch {}
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
-function safeRmDir(dir) {
-  try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
-}
-
-function run(cmd, maxBufferMb = 200) {
-  return new Promise((resolve, reject) => {
-    exec(cmd, { maxBuffer: 1024 * 1024 * maxBufferMb }, (err, stdout, stderr) => {
-      if (err) {
-        return reject({
-          err,
-          stdout,
-          stderr: (stderr || "").slice(-8000),
-        });
-      }
-      resolve({ stdout, stderr });
-    });
+async function downloadToFile(url, outPath) {
+  const resp = await axios.get(url, { responseType: "stream", timeout: 120000 });
+  await new Promise((resolve, reject) => {
+    const w = fs.createWriteStream(outPath);
+    resp.data.pipe(w);
+    w.on("finish", resolve);
+    w.on("error", reject);
   });
 }
 
-function clampZoomSpeed(z) {
-  let zoomSpeed = parseFloat(z);
-  if (isNaN(zoomSpeed)) zoomSpeed = 0.0003;
-  return Math.max(0.00005, Math.min(zoomSpeed, 0.002));
-}
+async function elevenTtsToFile(text, outPath) {
+  const apiKey = process.env.ELEVENLABS_API_KEY;
+  const voiceId = process.env.ELEVENLABS_VOICE_ID;
+  const modelId = process.env.ELEVENLABS_MODEL_ID || "eleven_multilingual_v2";
 
-function listFilesRecursive(dir) {
-  const out = [];
-  const stack = [dir];
-  while (stack.length) {
-    const cur = stack.pop();
-    const entries = fs.readdirSync(cur, { withFileTypes: true });
-    for (const e of entries) {
-      const full = path.join(cur, e.name);
-      if (e.isDirectory()) stack.push(full);
-      else out.push(full);
+  if (!apiKey || !voiceId) {
+    throw new Error("Missing ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID env");
+  }
+
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
+
+  // 429 için retry/backoff
+  let attempt = 0;
+  while (true) {
+    attempt++;
+    try {
+      const resp = await axios.post(
+        url,
+        {
+          text,
+          model_id: modelId,
+          voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+        },
+        {
+          headers: {
+            "xi-api-key": apiKey,
+            "Content-Type": "application/json",
+            Accept: "audio/mpeg"
+          },
+          responseType: "arraybuffer",
+          timeout: 120000
+        }
+      );
+
+      fs.writeFileSync(outPath, Buffer.from(resp.data));
+      return;
+    } catch (e) {
+      const status = e?.response?.status;
+      if (status === 429 && attempt <= 6) {
+        const waitMs = Math.min(15000, 800 * Math.pow(2, attempt));
+        await sleep(waitMs);
+        continue;
+      }
+      throw e;
     }
   }
-  return out;
 }
 
-/**
- * ✅ ESKİ ENDPOINT (KORUNDU)
- * image + audio => zoompan video
- */
+// 기존 endpoint: image+audio -> video
 app.post(
   "/render",
   upload.fields([{ name: "image" }, { name: "audio" }]),
@@ -66,7 +80,7 @@ app.post(
       if (!req.files?.image?.[0] || !req.files?.audio?.[0]) {
         return res.status(400).json({
           error: "Missing required files",
-          got: Object.keys(req.files || {}),
+          got: Object.keys(req.files || {})
         });
       }
 
@@ -74,30 +88,32 @@ app.post(
       const audio = req.files.audio[0].path;
       const output = "output.mp4";
 
-      let zoomSpeed = clampZoomSpeed(req.query.zoomSpeed);
+      let zoomSpeed = parseFloat(req.query.zoomSpeed);
+      if (isNaN(zoomSpeed)) zoomSpeed = 0.0003;
+      zoomSpeed = Math.max(0.00005, Math.min(zoomSpeed, 0.002));
 
       const cmd =
         `ffmpeg -y -loop 1 -i "${image}" -i "${audio}" ` +
-        `-filter_complex "[0:v]scale=1280:-2,zoompan=z='min(zoom+${zoomSpeed},1.15)':d=125:s=1280x720:fps=25[v]" ` +
+        `-filter_complex "[0:v]scale=1280:-2,zoompan=z='min(zoom+${zoomSpeed},1.15)':d=1:s=1280x720:fps=25[v]" ` +
         `-map "[v]" -map 1:a ` +
         `-c:v libx264 -preset veryfast -crf 30 ` +
         `-c:a aac -b:a 128k -ac 2 -ar 44100 ` +
         `-shortest -pix_fmt yuv420p -movflags +faststart "${output}"`;
 
-      exec(cmd, { maxBuffer: 1024 * 1024 * 20 }, (err, stdout, stderr) => {
+      exec(cmd, { maxBuffer: 1024 * 1024 * 40 }, (err, stdout, stderr) => {
         if (err) {
           return res.status(500).json({
             error: "ffmpeg failed",
             code: err.code,
             signal: err.signal,
-            stderr: (stderr || "").slice(-4000),
+            stderr: (stderr || "").slice(-4000)
           });
         }
 
         res.download(output, () => {
-          safeUnlink(image);
-          safeUnlink(audio);
-          safeUnlink(output);
+          try { fs.unlinkSync(image); } catch {}
+          try { fs.unlinkSync(audio); } catch {}
+          try { fs.unlinkSync(output); } catch {}
         });
       });
     } catch (e) {
@@ -106,128 +122,112 @@ app.post(
   }
 );
 
-/**
- * ✅ YENİ ENDPOINT
- * image + audiosZip(zip içinde sıralı mp3'ler) => 10dk video
- *
- * zip içi dosya adları: 0001_INTRO_TR.mp3, 0002_BISM_AR.mp3, 0003_AR_001.mp3 ...
- */
+// yeni endpoint: image + plan(json string) -> 10dk video (AR mp3 download + TR TTS)
 app.post(
   "/render10min",
-  upload.fields([{ name: "image", maxCount: 1 }, { name: "audiosZip", maxCount: 1 }]),
+  upload.fields([{ name: "image", maxCount: 1 }]),
   async (req, res) => {
-    const workId = crypto.randomBytes(8).toString("hex");
-    const workDir = path.join(os.tmpdir(), `render10min_${workId}`);
-    const audioDir = path.join(workDir, "audios");
-    const wavDir = path.join(workDir, "wav");
-    const listFile = path.join(workDir, "list.txt");
-    const mergedAudio = path.join(workDir, "merged.m4a");
-    const output = path.join(workDir, "output.mp4");
-
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "render10min-"));
     try {
-      if (!req.files?.image?.[0] || !req.files?.audiosZip?.[0]) {
-        return res.status(400).json({
-          error: "Missing required files",
-          got: Object.keys(req.files || {}),
-        });
+      if (!req.files?.image?.[0]) {
+        return res.status(400).json({ error: "Missing image" });
+      }
+      if (!req.body?.plan) {
+        return res.status(400).json({ error: "Missing plan field" });
       }
 
-      fs.mkdirSync(workDir, { recursive: true });
-      fs.mkdirSync(audioDir, { recursive: true });
-      fs.mkdirSync(wavDir, { recursive: true });
-
+      const plan = JSON.parse(req.body.plan);
       const imagePath = req.files.image[0].path;
-      const zipPath = req.files.audiosZip[0].path;
 
-      // zip extract
-      await fs
-        .createReadStream(zipPath)
-        .pipe(unzipper.Extract({ path: audioDir }))
-        .promise();
+      // sıralı job listesi üret
+      const jobs = [];
+      let order = 1;
+      const pad = (n) => String(n).padStart(4, "0");
 
-      // find mp3
-      const files = listFilesRecursive(audioDir)
-        .filter((f) => f.toLowerCase().endsWith(".mp3"))
-        .sort((a, b) => path.basename(a).localeCompare(path.basename(b)));
-
-      if (!files.length) {
-        return res.status(400).json({ error: "zip içinde mp3 bulunamadı" });
+      function addTTS(tag, text) {
+        jobs.push({ kind: "tts", order, fileName: `${pad(order)}_${tag}.mp3`, text });
+        order++;
+      }
+      function addDL(tag, url) {
+        jobs.push({ kind: "download", order, fileName: `${pad(order)}_${tag}.mp3`, url });
+        order++;
       }
 
-      // silence durations (optional query)
-      const pauseAfterAr = Math.max(0, parseFloat(req.query.pauseAfterAr ?? "0.6"));
-      const pauseAfterTr = Math.max(0, parseFloat(req.query.pauseAfterTr ?? "0.5"));
+      addTTS("TR_INTRO", plan.introText || "");
+      if (plan.useBismillahClip && plan.bismillahAudioUrl) addDL("AR_BISM", plan.bismillahAudioUrl);
+      addTTS("TR_SURE", plan.surahAnnouncementText || "");
 
-      // convert to wav + build concat list (+silence)
-      const lines = [];
-      let idx = 0;
+      for (const s of plan.segments || []) {
+        addDL(`AR_${String(s.ayah).padStart(3, "0")}`, s.arabicAudioUrl);
+        addTTS(`TR_${String(s.ayah).padStart(3, "0")}`, s.trText || "");
+      }
+      addTTS("TR_OUTRO", plan.outroText || "");
 
-      for (const mp3 of files) {
-        idx++;
-        const base = path.basename(mp3, ".mp3");
-        const wav = path.join(wavDir, `${String(idx).padStart(4, "0")}_${base}.wav`);
-
-        // mp3 -> wav (unified format)
-        await run(
-          `ffmpeg -y -i "${mp3}" -ac 2 -ar 44100 -c:a pcm_s16le "${wav}"`,
-          200
-        );
-        lines.push(`file '${wav.replace(/'/g, "'\\''")}'`);
-
-        // decide silence based on filename tag
-        const upper = base.toUpperCase();
-        const isAr = upper.includes("_AR_") || upper.includes("_BISM_") || upper.includes("_AR.");
-        const isTr = upper.includes("_TR_") || upper.includes("_INTRO_") || upper.includes("_SURE_") || upper.includes("_OUTRO_");
-
-        const dur = isAr ? pauseAfterAr : isTr ? pauseAfterTr : 0;
-        if (dur > 0.01) {
-          const silenceWav = path.join(wavDir, `${String(idx).padStart(4, "0")}_silence_${dur}.wav`);
-          await run(
-            `ffmpeg -y -f lavfi -i "anullsrc=r=44100:cl=stereo" -t ${dur} -c:a pcm_s16le "${silenceWav}"`,
-            50
-          );
-          lines.push(`file '${silenceWav.replace(/'/g, "'\\''")}'`);
+      // mp3'leri sırayla üret/indir (429 olmasın diye SEQ)
+      const audioFiles = [];
+      for (const j of jobs) {
+        const out = path.join(tmpDir, j.fileName);
+        if (j.kind === "download") {
+          await downloadToFile(j.url, out);
+        } else {
+          await elevenTtsToFile(j.text, out);
+          // küçük throttle (free plan için iyi)
+          await sleep(900);
         }
+        audioFiles.push(out);
       }
 
-      fs.writeFileSync(listFile, lines.join("\n"));
-
-      // concat wav -> m4a
-      await run(
-        `ffmpeg -y -f concat -safe 0 -i "${listFile}" -c:a aac -b:a 192k "${mergedAudio}"`,
-        300
+      // concat list
+      const listPath = path.join(tmpDir, "list.txt");
+      fs.writeFileSync(
+        listPath,
+        audioFiles.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join("\n"),
+        "utf8"
       );
 
-      // video render (zoompan)
-      let zoomSpeed = clampZoomSpeed(req.query.zoomSpeed);
+      const audioOut = path.join(tmpDir, "all.mp3");
+      const concatCmd =
+        `ffmpeg -y -f concat -safe 0 -i "${listPath}" ` +
+        `-c:a libmp3lame -b:a 128k "${audioOut}"`;
 
-      await run(
-        `ffmpeg -y -loop 1 -i "${imagePath}" -i "${mergedAudio}" ` +
-          `-filter_complex "[0:v]scale=1280:-2,zoompan=z='min(zoom+${zoomSpeed},1.15)':d=125:s=1280x720:fps=25[v]" ` +
-          `-map "[v]" -map 1:a ` +
-          `-c:v libx264 -preset veryfast -crf 30 ` +
-          `-c:a aac -b:a 192k -ac 2 -ar 44100 ` +
-          `-shortest -pix_fmt yuv420p -movflags +faststart "${output}"`,
-        300
-      );
+      await new Promise((resolve, reject) => {
+        exec(concatCmd, { maxBuffer: 1024 * 1024 * 40 }, (err, stdout, stderr) => {
+          if (err) {
+            reject(new Error((stderr || "").slice(-4000)));
+          } else resolve();
+        });
+      });
+
+      const output = path.join(tmpDir, "output.mp4");
+
+      // zoom video
+      const zoomSpeed = 0.00025;
+      const videoCmd =
+        `ffmpeg -y -loop 1 -i "${imagePath}" -i "${audioOut}" ` +
+        `-filter_complex "[0:v]scale=1280:-2,zoompan=z='min(zoom+${zoomSpeed},1.15)':d=1:s=1280x720:fps=25[v]" ` +
+        `-map "[v]" -map 1:a ` +
+        `-c:v libx264 -preset veryfast -crf 30 ` +
+        `-c:a aac -b:a 128k -ac 2 -ar 44100 ` +
+        `-shortest -pix_fmt yuv420p -movflags +faststart "${output}"`;
+
+      await new Promise((resolve, reject) => {
+        exec(videoCmd, { maxBuffer: 1024 * 1024 * 40 }, (err, stdout, stderr) => {
+          if (err) {
+            reject(new Error((stderr || "").slice(-4000)));
+          } else resolve();
+        });
+      });
 
       res.download(output, () => {
-        safeUnlink(imagePath);
-        safeUnlink(zipPath);
-        safeRmDir(workDir);
+        // cleanup
+        try { fs.unlinkSync(imagePath); } catch {}
+        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
       });
     } catch (e) {
-      safeRmDir(workDir);
-      return res.status(500).json({
-        error: "render10min failed",
-        message: String(e?.err || e),
-        stderr: e?.stderr,
-      });
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      return res.status(500).json({ error: "server error", message: String(e?.message || e) });
     }
   }
 );
 
-app.get("/health", (_, res) => res.json({ ok: true }));
-
 app.listen(3000, () => console.log("server running on 3000"));
- 
