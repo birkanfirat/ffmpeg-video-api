@@ -22,9 +22,19 @@ app.post(
       const audio = req.files.audio[0].path;
       const output = "output.mp4";
 
+      // Zoom hızı parametresi
+      let zoomSpeed = parseFloat(req.query.zoomSpeed);
+
+      if (isNaN(zoomSpeed)) {
+        zoomSpeed = 0.0003; // varsayılan
+      }
+
+      // Güvenli aralık
+      zoomSpeed = Math.max(0.00005, Math.min(zoomSpeed, 0.002));
+
       const cmd =
         `ffmpeg -y -loop 1 -i "${image}" -i "${audio}" ` +
-        `-filter_complex "[0:v]scale=1280:-2,zoompan=z='min(zoom+0.0005,1.15)':d=125:s=1280x720:fps=25[v]" ` +
+        `-filter_complex "[0:v]scale=1280:-2,zoompan=z='min(zoom+${zoomSpeed},1.15)':d=125:s=1280x720:fps=25[v]" ` +
         `-map "[v]" -map 1:a ` +
         `-c:v libx264 -preset veryfast -crf 30 ` +
         `-c:a aac -b:a 128k -ac 2 -ar 44100 ` +
