@@ -6,6 +6,52 @@ const fs = require("fs");
 const app = express();
 const upload = multer({ dest: "uploads/" });
 
+function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
+
+// keyframe'ler arası lineer interpolasyon yapan zoom if zinciri üretir
+function buildZoomExpr(frames, fps) {
+  // Kaç segment olsun? (3-6 arası)
+  const segments = Math.floor(Math.random() * 4) + 3;
+
+  // Zoom aralığı: çok agresif olmasın
+  const zMin = 1.0;
+  const zMax = 1.14;
+
+  // Keyframe frame indexleri (0..frames)
+  const points = [0];
+  for (let i = 1; i < segments; i++) {
+    points.push(Math.floor((frames * i) / segments));
+  }
+  points.push(frames);
+
+  // Zoom değerleri (smooth)
+  // İlk değer 1.0 yakınında başlasın
+  const zooms = [1.0 + Math.random() * 0.03];
+  for (let i = 1; i < points.length; i++) {
+    // Bir önceki değerden çok kopmasın diye küçük adımlarla gezdiriyoruz
+    const prev = zooms[i - 1];
+    const delta = (Math.random() * 0.08) - 0.04; // -0.04..+0.04
+    const next = clamp(prev + delta, zMin, zMax);
+    zooms.push(next);
+  }
+
+  // FFmpeg zoompan 'z=' if zinciri:
+  // if(between(on,p0,p1), z0 + (z1-z0)*(on-p0)/(p1-p0), ... )
+  let expr = "";
+  for (let i = 0; i < points.length - 1; i++) {
+    const p0 = points[i];
+    const p1 = points[i + 1];
+    const z0 = zooms[i].toFixed(4);
+    const z1 = zooms[i + 1].toFixed(4);
+    const seg = `if(between(on\\,${p0}\\,${p1})\\,(${z0})+(${z1}-${z0})*((on-${p0})/(${Math.max(1, p1 - p0)}))\\,`;
+    expr += seg;
+  }
+  // fallback son değer
+  expr += `${zooms[zooms.length - 1].toFixed(4)}` + ")".repeat(points.length - 1);
+
+  return expr;
+}
+
 app.post("/render", upload.fields([{ name: "image" }, { name: "audio" }]), (req, res) => {
   try {
     if (!req.files?.image?.[0] || !req.files?.audio?.[0]) {
@@ -16,7 +62,7 @@ app.post("/render", upload.fields([{ name: "image" }, { name: "audio" }]), (req,
     const audio = req.files.audio[0].path;
     const output = "output.mp4";
 
-    // 1) Audio süresini al (saniye)
+    // Audio süresini al (saniye)
     const probeCmd = `ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "${audio}"`;
 
     exec(probeCmd, (probeErr, probeStdout) => {
@@ -26,33 +72,26 @@ app.post("/render", upload.fields([{ name: "image" }, { name: "audio" }]), (req,
 
       const durationSec = Math.max(1, Math.floor(parseFloat(String(probeStdout).trim()) || 60));
       const fps = 25;
+
+      // CPU/RAM rahatlatmak için sabit çözünürlük
+      const outW = 1280;
+      const outH = 720;
+
       const totalFrames = durationSec * fps;
 
-      // Zoom ayarları
-      const zMin = 1.0;
-      const zMax = 1.12; // zoom-in hedefi (istersen 1.08 - 1.20 arası)
-      const halfFrames = Math.floor(totalFrames / 2);
+      // Rastgele ama smooth zoom ifadesi
+      const zoomExpr = buildZoomExpr(totalFrames, fps);
 
-      // 2) İki yarıyı ayrı üretip concat ile birleştir
-      // İlk yarı: zoom in
+      // Zoom merkezini ortada tut (x,y)
+      const xExpr = `(iw/2)-(iw/zoom/2)`;
+      const yExpr = `(ih/2)-(ih/zoom/2)`;
+
       const cmd =
         `ffmpeg -y -loop 1 -i "${image}" -i "${audio}" ` +
-        `-filter_complex ` +
-        `"` +
-        // Video source scale
-        `[0:v]scale=1280:-2,` +
-        // 1. parça (zoom in)
-        `zoompan=z='if(lte(on,${halfFrames}),${zMin}+(${zMax}-${zMin})*(on/${halfFrames}),${zMax})':` +
-        `d=1:s=1280x720:fps=${fps},` +
-        // Zamanı ikiye böl: ilk yarı / ikinci yarı
-        `split=2[v1][v2];` +
-        // v1 = ilk yarı (0..halfFrames)
-        `[v1]trim=0:${halfFrames / fps},setpts=PTS-STARTPTS[v_in];` +
-        // v2 = ikinci yarı (zoom out) (halfFrames..end)
-        `[v2]trim=${halfFrames / fps}:${durationSec},setpts=PTS-STARTPTS,` +
-        `zoompan=z='${zMax}-(${zMax}-${zMin})*(on/${Math.max(1, totalFrames - halfFrames)})':d=1:s=1280x720:fps=${fps}[v_out];` +
-        // concat
-        `[v_in][v_out]concat=n=2:v=1:a=0[v]" ` +
+        `-filter_complex "` +
+        `[0:v]scale=${outW}:-2,` +
+        `zoompan=z='${zoomExpr}':x='${xExpr}':y='${yExpr}':d=1:s=${outW}x${outH}:fps=${fps}[v]` +
+        `" ` +
         `-map "[v]" -map 1:a ` +
         `-c:v libx264 -preset veryfast -crf 30 ` +
         `-c:a aac -b:a 128k -ac 2 -ar 44100 ` +
@@ -64,6 +103,7 @@ app.post("/render", upload.fields([{ name: "image" }, { name: "audio" }]), (req,
             error: "ffmpeg failed",
             code: err.code,
             signal: err.signal,
+            cmd,
             stderr: (stderr || "").slice(-4000)
           });
         }
