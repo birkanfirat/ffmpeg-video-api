@@ -36,7 +36,7 @@ app.post("/render", upload.fields([{ name: "image" }, { name: "audio" }]), (req,
 
       // Zoom ayarı: 1.00 -> 1.08 (çok hafif, titreme yok)
       const zStart = 1.0;
-      const zEnd = 1.08;
+      const zEnd = 1.12;
 
       const totalFrames = durationSec * fps;
 
