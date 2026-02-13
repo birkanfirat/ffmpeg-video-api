@@ -4,7 +4,8 @@ const { exec } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const axios = require("axios");
+const { pipeline } = require("stream/promises");
+const { Readable } = require("stream");
 
 const app = express();
 const upload = multer({ dest: "uploads/" });
@@ -14,13 +15,14 @@ function sleep(ms) {
 }
 
 async function downloadToFile(url, outPath) {
-  const resp = await axios.get(url, { responseType: "stream", timeout: 120000 });
-  await new Promise((resolve, reject) => {
-    const w = fs.createWriteStream(outPath);
-    resp.data.pipe(w);
-    w.on("finish", resolve);
-    w.on("error", reject);
-  });
+  const resp = await fetch(url, { method: "GET" });
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => "");
+    throw new Error(`Download failed ${resp.status}: ${txt.slice(0, 200)}`);
+  }
+  if (!resp.body) throw new Error("Download response has no body");
+  const nodeStream = Readable.fromWeb(resp.body);
+  await pipeline(nodeStream, fs.createWriteStream(outPath));
 }
 
 async function elevenTtsToFile(text, outPath) {
@@ -34,44 +36,42 @@ async function elevenTtsToFile(text, outPath) {
 
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
 
-  // 429 için retry/backoff
   let attempt = 0;
   while (true) {
     attempt++;
-    try {
-      const resp = await axios.post(
-        url,
-        {
-          text,
-          model_id: modelId,
-          voice_settings: { stability: 0.5, similarity_boost: 0.75 }
-        },
-        {
-          headers: {
-            "xi-api-key": apiKey,
-            "Content-Type": "application/json",
-            Accept: "audio/mpeg"
-          },
-          responseType: "arraybuffer",
-          timeout: 120000
-        }
-      );
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "xi-api-key": apiKey,
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg",
+      },
+      body: JSON.stringify({
+        text,
+        model_id: modelId,
+        voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+      }),
+    });
 
-      fs.writeFileSync(outPath, Buffer.from(resp.data));
+    if (resp.ok) {
+      const buf = Buffer.from(await resp.arrayBuffer());
+      fs.writeFileSync(outPath, buf);
       return;
-    } catch (e) {
-      const status = e?.response?.status;
-      if (status === 429 && attempt <= 6) {
-        const waitMs = Math.min(15000, 800 * Math.pow(2, attempt));
-        await sleep(waitMs);
-        continue;
-      }
-      throw e;
     }
+
+    // 429 backoff
+    if (resp.status === 429 && attempt <= 6) {
+      const waitMs = Math.min(15000, 800 * Math.pow(2, attempt));
+      await sleep(waitMs);
+      continue;
+    }
+
+    const errTxt = await resp.text().catch(() => "");
+    throw new Error(`ElevenLabs failed ${resp.status}: ${errTxt.slice(0, 400)}`);
   }
 }
 
-// 기존 endpoint: image+audio -> video
+// ✅ Eski endpoint aynen duruyor: image + audio -> video
 app.post(
   "/render",
   upload.fields([{ name: "image" }, { name: "audio" }]),
@@ -80,7 +80,7 @@ app.post(
       if (!req.files?.image?.[0] || !req.files?.audio?.[0]) {
         return res.status(400).json({
           error: "Missing required files",
-          got: Object.keys(req.files || {})
+          got: Object.keys(req.files || {}),
         });
       }
 
@@ -106,7 +106,7 @@ app.post(
             error: "ffmpeg failed",
             code: err.code,
             signal: err.signal,
-            stderr: (stderr || "").slice(-4000)
+            stderr: (stderr || "").slice(-4000),
           });
         }
 
@@ -122,36 +122,25 @@ app.post(
   }
 );
 
-// yeni endpoint: image + plan(json string) -> 10dk video (AR mp3 download + TR TTS)
+// ✅ Yeni endpoint: image + plan -> 10dk video (AR mp3 download + TR TTS)  (axios yok)
 app.post(
   "/render10min",
   upload.fields([{ name: "image", maxCount: 1 }]),
   async (req, res) => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "render10min-"));
     try {
-      if (!req.files?.image?.[0]) {
-        return res.status(400).json({ error: "Missing image" });
-      }
-      if (!req.body?.plan) {
-        return res.status(400).json({ error: "Missing plan field" });
-      }
+      if (!req.files?.image?.[0]) return res.status(400).json({ error: "Missing image" });
+      if (!req.body?.plan) return res.status(400).json({ error: "Missing plan field" });
 
       const plan = JSON.parse(req.body.plan);
       const imagePath = req.files.image[0].path;
 
-      // sıralı job listesi üret
       const jobs = [];
       let order = 1;
       const pad = (n) => String(n).padStart(4, "0");
 
-      function addTTS(tag, text) {
-        jobs.push({ kind: "tts", order, fileName: `${pad(order)}_${tag}.mp3`, text });
-        order++;
-      }
-      function addDL(tag, url) {
-        jobs.push({ kind: "download", order, fileName: `${pad(order)}_${tag}.mp3`, url });
-        order++;
-      }
+      const addTTS = (tag, text) => jobs.push({ kind: "tts", order: order++, fileName: `${pad(order - 1)}_${tag}.mp3`, text });
+      const addDL  = (tag, url)  => jobs.push({ kind: "download", order: order++, fileName: `${pad(order - 1)}_${tag}.mp3`, url });
 
       addTTS("TR_INTRO", plan.introText || "");
       if (plan.useBismillahClip && plan.bismillahAudioUrl) addDL("AR_BISM", plan.bismillahAudioUrl);
@@ -163,7 +152,7 @@ app.post(
       }
       addTTS("TR_OUTRO", plan.outroText || "");
 
-      // mp3'leri sırayla üret/indir (429 olmasın diye SEQ)
+      // ✅ SEQ üretim/indirme (429 riskini minimize eder)
       const audioFiles = [];
       for (const j of jobs) {
         const out = path.join(tmpDir, j.fileName);
@@ -171,13 +160,12 @@ app.post(
           await downloadToFile(j.url, out);
         } else {
           await elevenTtsToFile(j.text, out);
-          // küçük throttle (free plan için iyi)
           await sleep(900);
         }
         audioFiles.push(out);
       }
 
-      // concat list
+      // ffmpeg concat list
       const listPath = path.join(tmpDir, "list.txt");
       fs.writeFileSync(
         listPath,
@@ -192,16 +180,14 @@ app.post(
 
       await new Promise((resolve, reject) => {
         exec(concatCmd, { maxBuffer: 1024 * 1024 * 40 }, (err, stdout, stderr) => {
-          if (err) {
-            reject(new Error((stderr || "").slice(-4000)));
-          } else resolve();
+          if (err) reject(new Error((stderr || "").slice(-4000)));
+          else resolve();
         });
       });
 
       const output = path.join(tmpDir, "output.mp4");
-
-      // zoom video
       const zoomSpeed = 0.00025;
+
       const videoCmd =
         `ffmpeg -y -loop 1 -i "${imagePath}" -i "${audioOut}" ` +
         `-filter_complex "[0:v]scale=1280:-2,zoompan=z='min(zoom+${zoomSpeed},1.15)':d=1:s=1280x720:fps=25[v]" ` +
@@ -212,14 +198,12 @@ app.post(
 
       await new Promise((resolve, reject) => {
         exec(videoCmd, { maxBuffer: 1024 * 1024 * 40 }, (err, stdout, stderr) => {
-          if (err) {
-            reject(new Error((stderr || "").slice(-4000)));
-          } else resolve();
+          if (err) reject(new Error((stderr || "").slice(-4000)));
+          else resolve();
         });
       });
 
       res.download(output, () => {
-        // cleanup
         try { fs.unlinkSync(imagePath); } catch {}
         try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
       });
@@ -230,4 +214,5 @@ app.post(
   }
 );
 
-app.listen(3000, () => console.log("server running on 3000"));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("server running on", PORT));
