@@ -148,7 +148,7 @@ async function wavToM4a(inWav, outM4a) {
   ]);
 }
 
-async function imagePlusAudioToMp4(imagePath, audioPath, outMp4) {
+/*async function imagePlusAudioToMp4(imagePath, audioPath, outMp4) {
   await runCmd("ffmpeg", [
     "-y",
     "-loop", "1",
@@ -159,6 +159,31 @@ async function imagePlusAudioToMp4(imagePath, audioPath, outMp4) {
     "-r", "30",
     "-pix_fmt", "yuv420p",
     "-c:a", "aac",
+    "-shortest",
+    outMp4,
+  ]);
+}*/
+async function imagePlusAudioToMp4(imagePath, audioPath, outMp4) {
+  await runCmd("ffmpeg", [
+    "-y",
+    "-loop", "1",
+    "-i", imagePath,
+    "-i", audioPath,
+
+    // 4K gelirse bile 1080p/720p'e düşür (Railway'de şart)
+    "-vf", "scale=1280:-2",           // istersen 1920:-2 yap
+
+    "-c:v", "libx264",
+    "-preset", "veryfast",            // ultrafast daha da hafif ama kalite düşer
+    "-crf", "28",                     // 23-30 arası; yükseldikçe dosya küçülür
+    "-tune", "stillimage",
+    "-r", "30",
+    "-pix_fmt", "yuv420p",
+
+    "-c:a", "aac",
+    "-b:a", "160k",
+    "-movflags", "+faststart",
+
     "-shortest",
     outMp4,
   ]);
