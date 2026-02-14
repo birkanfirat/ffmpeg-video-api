@@ -1,302 +1,356 @@
-"use strict";
+/* server.js
+ * Endpoints:
+ *  POST /render10min/start   (multipart: image file + plan JSON string)
+ *  GET  /render10min/status/:jobId   -> { status: "processing"|"done"|"error", stage?, error? }
+ *  GET  /render10min/result/:jobId   -> mp4 file stream
+ */
 
 const express = require("express");
 const multer = require("multer");
-const { spawn, exec } = require("child_process");
-const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const fs = require("fs");
+const fsp = require("fs/promises");
+const { spawn } = require("child_process");
 const crypto = require("crypto");
-const { pipeline } = require("stream/promises");
-const { Readable } = require("stream");
+const OpenAI = require("openai");
 
 const app = express();
-const upload = multer({
-  dest: "uploads/",
-  limits: { fileSize: 25 * 1024 * 1024 } // 25MB
-});
-
-process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
-process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
-
-app.get("/", (req, res) => res.status(200).send("OK"));
-app.get("/health", (req, res) => res.json({ ok: true }));
-app.get("/render10min/health", (req, res) => res.json({ ok: true, route: "render10min" }));
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-function safeUnlink(p) {
-  try { if (p && fs.existsSync(p)) fs.unlinkSync(p); } catch {}
-}
-function safeRmDir(dir) {
-  try { if (dir && fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true }); } catch {}
-}
-
-function runSpawn(cmd, args, { input, timeoutMs } = {}) {
-  return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"] });
-
-    let stderr = "";
-    p.stderr.on("data", (d) => (stderr += d.toString()));
-
-    let timer;
-    if (timeoutMs) {
-      timer = setTimeout(() => {
-        try { p.kill("SIGKILL"); } catch {}
-        reject(new Error(`${cmd} timeout after ${timeoutMs}ms`));
-      }, timeoutMs);
-    }
-
-    p.on("error", (err) => {
-      if (timer) clearTimeout(timer);
-      reject(err);
-    });
-
-    p.on("close", (code) => {
-      if (timer) clearTimeout(timer);
-      if (code === 0) resolve();
-      else reject(new Error(`${cmd} exit ${code}: ${stderr.slice(-2000)}`));
-    });
-
-    if (input !== undefined) {
-      p.stdin.write(String(input));
-    }
-    p.stdin.end();
-  });
-}
-
-async function downloadToFile(url, outPath) {
-  const resp = await fetch(url, { method: "GET" });
-  if (!resp.ok) {
-    const txt = await resp.text().catch(() => "");
-    throw new Error(`Download failed ${resp.status}: ${txt.slice(0, 300)}`);
-  }
-  if (!resp.body) throw new Error("Download response has no body");
-
-  const nodeStream = Readable.fromWeb(resp.body);
-  await pipeline(nodeStream, fs.createWriteStream(outPath));
-}
-
-async function turkishTtsToMp3(text, outMp3) {
-  const wav = outMp3.replace(/\.mp3$/i, ".wav");
-  const speed = process.env.ESPEAK_SPEED || "150"; // istersen Railway env ile değiştir
-
-  // espeak-ng stdin'den okuyup wav üretir
-  await runSpawn("espeak-ng", ["-v", "tr", "-s", speed, "-w", wav], {
-    input: (text && String(text).trim().length ? text : " "),
-    timeoutMs: 120000
-  });
-
-  // wav -> mp3
-  await new Promise((resolve, reject) => {
-    exec(
-      `ffmpeg -y -i "${wav}" -ac 2 -ar 44100 -b:a 128k "${outMp3}"`,
-      { maxBuffer: 1024 * 1024 * 20 },
-      (err, stdout, stderr) => (err ? reject(new Error((stderr || "").slice(-2000))) : resolve())
-    );
-  });
-
-  safeUnlink(wav);
-}
-
-// -------------------- /render (eski) --------------------
-app.post("/render", upload.fields([{ name: "image" }, { name: "audio" }]), (req, res) => {
-  try {
-    if (!req.files?.image?.[0] || !req.files?.audio?.[0]) {
-      return res.status(400).json({ error: "Missing required files", got: Object.keys(req.files || {}) });
-    }
-
-    const image = req.files.image[0].path;
-    const audio = req.files.audio[0].path;
-    const output = "output.mp4";
-
-    let zoomSpeed = parseFloat(req.query.zoomSpeed);
-    if (isNaN(zoomSpeed)) zoomSpeed = 0.0003;
-    zoomSpeed = Math.max(0.00005, Math.min(zoomSpeed, 0.002));
-
-    const cmd =
-      `ffmpeg -y -loop 1 -i "${image}" -i "${audio}" ` +
-      `-filter_complex "[0:v]scale=1280:-2,zoompan=z='min(zoom+${zoomSpeed},1.15)':d=1:s=1280x720:fps=25[v]" ` +
-      `-map "[v]" -map 1:a ` +
-      `-c:v libx264 -preset veryfast -crf 30 ` +
-      `-c:a aac -b:a 128k -ac 2 -ar 44100 ` +
-      `-shortest -pix_fmt yuv420p -movflags +faststart "${output}"`;
-
-    exec(cmd, { maxBuffer: 1024 * 1024 * 40 }, (err, stdout, stderr) => {
-      if (err) {
-        return res.status(500).json({ error: "ffmpeg failed", stderr: (stderr || "").slice(-4000) });
-      }
-      res.download(output, () => {
-        safeUnlink(image);
-        safeUnlink(audio);
-        safeUnlink(output);
-      });
-    });
-  } catch (e) {
-    return res.status(500).json({ error: "server error", message: String(e?.message || e) });
-  }
-});
-
-// -------------------- render10min job sistemi --------------------
-const jobs = new Map(); // jobId -> {status, dir, output, error, createdAt}
-const MAX_JOB_MS = Number(process.env.MAX_JOB_MS || 45 * 60 * 1000); // 45dk
-
-function buildJobsFromPlan(plan) {
-  const arr = [];
-  let order = 1;
-  const pad = (n) => String(n).padStart(4, "0");
-
-  function addTTS(tag, text) {
-    arr.push({ kind: "tts", order, fileName: `${pad(order)}_${tag}.mp3`, text: text || "" });
-    order++;
-  }
-  function addDL(tag, url) {
-    arr.push({ kind: "download", order, fileName: `${pad(order)}_${tag}.mp3`, url });
-    order++;
-  }
-
-  // önce TR intro
-  addTTS("TR_INTRO", plan.introText);
-
-  // sonra varsa AR bismillah
-  if (plan.useBismillahClip && plan.bismillahAudioUrl) addDL("AR_BISM", plan.bismillahAudioUrl);
-
-  // sure anons TR
-  addTTS("TR_SURE", plan.surahAnnouncementText);
-
-  // her ayet: AR mp3 -> TR TTS
-  for (const s of plan.segments || []) {
-    if (!s?.arabicAudioUrl) continue;
-    addDL(`AR_${String(s.ayah).padStart(3, "0")}`, s.arabicAudioUrl);
-    addTTS(`TR_${String(s.ayah).padStart(3, "0")}`, s.trText);
-  }
-
-  // TR outro
-  addTTS("TR_OUTRO", plan.outroText);
-
-  return arr;
-}
-
-async function runRender10MinJob(jobId, plan, imagePath, dir) {
-  const st = jobs.get(jobId);
-  if (!st) return;
-
-  try {
-    const work = buildJobsFromPlan(plan);
-    const audioFiles = [];
-
-    for (const j of work) {
-      const out = path.join(dir, j.fileName);
-      if (j.kind === "download") {
-        await downloadToFile(j.url, out);
-      } else {
-        await turkishTtsToMp3(j.text, out);
-        await sleep(250); // hafif throttle
-      }
-      audioFiles.push(out);
-    }
-
-    // concat list
-    const listPath = path.join(dir, "list.txt");
-    fs.writeFileSync(
-      listPath,
-      audioFiles.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join("\n"),
-      "utf8"
-    );
-
-    const audioOut = path.join(dir, "all.mp3");
-    await new Promise((resolve, reject) => {
-      exec(
-        `ffmpeg -y -f concat -safe 0 -i "${listPath}" -c:a libmp3lame -b:a 128k "${audioOut}"`,
-        { maxBuffer: 1024 * 1024 * 40 },
-        (err, stdout, stderr) => (err ? reject(new Error((stderr || "").slice(-4000))) : resolve())
-      );
-    });
-
-    // video
-    const output = path.join(dir, "output.mp4");
-    const zoomSpeed = 0.00025;
-
-    await new Promise((resolve, reject) => {
-      exec(
-        `ffmpeg -y -loop 1 -i "${imagePath}" -i "${audioOut}" ` +
-          `-filter_complex "[0:v]scale=1280:-2,zoompan=z='min(zoom+${zoomSpeed},1.15)':d=1:s=1280x720:fps=25[v]" ` +
-          `-map "[v]" -map 1:a -c:v libx264 -preset veryfast -crf 30 ` +
-          `-c:a aac -b:a 128k -ac 2 -ar 44100 -shortest -pix_fmt yuv420p -movflags +faststart "${output}"`,
-        { maxBuffer: 1024 * 1024 * 60 },
-        (err, stdout, stderr) => (err ? reject(new Error((stderr || "").slice(-4000))) : resolve())
-      );
-    });
-
-    st.status = "done";
-    st.output = output;
-    st.error = null;
-  } catch (e) {
-    st.status = "error";
-    st.error = String(e?.message || e);
-  }
-}
-
-// GET ile bakınca “POST kullan” desin diye:
-app.get("/render10min/start", (req, res) => res.status(405).json({ error: "Use POST /render10min/start" }));
-
-app.post("/render10min/start", upload.fields([{ name: "image", maxCount: 1 }]), async (req, res) => {
-  // tek job aynı anda (opsiyonel)
-  for (const v of jobs.values()) {
-    if (v.status === "processing") return res.status(429).json({ error: "A job is already processing" });
-  }
-
-  const jobId = crypto.randomUUID();
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `job-${jobId}-`));
-
-  try {
-    if (!req.files?.image?.[0]) return res.status(400).json({ error: "Missing image" });
-    if (!req.body?.plan) return res.status(400).json({ error: "Missing plan field" });
-
-    const plan = JSON.parse(req.body.plan);
-
-    const tempImage = req.files.image[0].path;
-    const ext = path.extname(req.files.image[0].originalname || "") || ".png";
-    const imagePath = path.join(dir, `image${ext}`);
-    fs.renameSync(tempImage, imagePath);
-
-    jobs.set(jobId, { status: "processing", dir, output: null, error: null, createdAt: Date.now() });
-
-    // async başlat
-    setImmediate(() => runRender10MinJob(jobId, plan, imagePath, dir));
-
-    return res.json({ jobId, status: "processing" });
-  } catch (e) {
-    jobs.set(jobId, { status: "error", dir, output: null, error: String(e?.message || e), createdAt: Date.now() });
-    return res.status(500).json({ error: "server error", message: String(e?.message || e) });
-  }
-});
-
-app.get("/render10min/status/:id", (req, res) => {
-  const st = jobs.get(req.params.id);
-  if (!st) return res.status(404).json({ error: "job not found" });
-
-  if (st.status === "processing" && (Date.now() - st.createdAt) > MAX_JOB_MS) {
-    st.status = "error";
-    st.error = "timeout";
-  }
-
-  return res.json({ jobId: req.params.id, status: st.status, error: st.error || null });
-});
-
-app.get("/render10min/result/:id", (req, res) => {
-  const st = jobs.get(req.params.id);
-  if (!st) return res.status(404).json({ error: "job not found" });
-  if (st.status === "error") return res.status(500).json({ error: st.error || "job failed" });
-  if (st.status !== "done" || !st.output) return res.status(425).json({ error: "not ready" });
-
-  res.download(st.output, () => {
-    safeRmDir(st.dir);
-    jobs.delete(req.params.id);
-  });
-});
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () => console.log("server running on", PORT));
+
+// IMPORTANT: set OPENAI_API_KEY in Railway env vars
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// Multer: keep image in memory then write to job folder
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
+});
+
+// In-memory job store (Railway restart -> reset). For production, persist to Redis/S3.
+const jobs = new Map();
+/**
+ * job: {
+ *   status: "processing"|"done"|"error",
+ *   stage: string,
+ *   error?: string,
+ *   dir: string,
+ *   outputPath?: string,
+ *   createdAt: number
+ * }
+ */
+
+function uid() {
+  return crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
+}
+
+function runCmd(bin, args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"], ...opts });
+    let out = "";
+    let err = "";
+    p.stdout.on("data", (d) => (out += d.toString()));
+    p.stderr.on("data", (d) => (err += d.toString()));
+    p.on("error", reject);
+    p.on("close", (code) => {
+      if (code === 0) resolve({ out, err });
+      else reject(new Error(`${bin} ${args.join(" ")} failed (code=${code}):\n${err}`));
+    });
+  });
+}
+
+async function ffprobeDurationSec(filePath) {
+  const args = [
+    "-v", "error",
+    "-show_entries", "format=duration",
+    "-of", "default=noprint_wrappers=1:nokey=1",
+    filePath,
+  ];
+  const { out } = await runCmd("ffprobe", args);
+  const v = Number(String(out).trim());
+  return Number.isFinite(v) ? v : 0;
+}
+
+async function writeFileSafe(filePath, buffer) {
+  await fsp.mkdir(path.dirname(filePath), { recursive: true });
+  await fsp.writeFile(filePath, buffer);
+}
+
+async function downloadToFile(url, filePath) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Download failed ${res.status}: ${url}`);
+  const ab = await res.arrayBuffer();
+  await writeFileSafe(filePath, Buffer.from(ab));
+}
+
+async function ttsToWav(text, wavPath) {
+  // Less robotic: gpt-4o-mini-tts + voice marin + wav output
+  // (Model/voice list documented by OpenAI.)
+  const response = await openai.audio.speech.create({
+    model: "gpt-4o-mini-tts", // or snapshot: "gpt-4o-mini-tts-2025-12-15"
+    voice: "marin",
+    input: text,
+    // "instructions" supported per API reference:
+    instructions:
+      "Türkçe doğal ve sıcak anlatım. Net diksiyon. Cümle sonlarında kısa duraksamalar. Robotik ton yok. Okuma hızı sakin.",
+    response_format: "wav",
+    speed: 0.98,
+  });
+
+  const buf = Buffer.from(await response.arrayBuffer());
+  await writeFileSafe(wavPath, buf);
+}
+
+// Normalize any audio to 48kHz mono WAV PCM (concat sorunlarını bitirir)
+async function normalizeToWav(inPath, outWav) {
+  await runCmd("ffmpeg", [
+    "-y",
+    "-i", inPath,
+    "-ar", "48000",
+    "-ac", "1",
+    "-c:a", "pcm_s16le",
+    outWav,
+  ]);
+}
+
+async function concatWavs(listFilePath, outWav) {
+  await runCmd("ffmpeg", [
+    "-y",
+    "-f", "concat",
+    "-safe", "0",
+    "-i", listFilePath,
+    "-c:a", "pcm_s16le",
+    outWav,
+  ]);
+}
+
+async function padOrTrimTo600s(inWav, outWav) {
+  // Pad with silence if short, trim if long, target exactly 600 seconds
+  await runCmd("ffmpeg", [
+    "-y",
+    "-i", inWav,
+    "-af", "apad",
+    "-t", "600",
+    "-ar", "48000",
+    "-ac", "1",
+    "-c:a", "pcm_s16le",
+    outWav,
+  ]);
+}
+
+async function wavToM4a(inWav, outM4a) {
+  await runCmd("ffmpeg", [
+    "-y",
+    "-i", inWav,
+    "-c:a", "aac",
+    "-b:a", "192k",
+    outM4a,
+  ]);
+}
+
+async function imagePlusAudioToMp4(imagePath, audioPath, outMp4) {
+  await runCmd("ffmpeg", [
+    "-y",
+    "-loop", "1",
+    "-i", imagePath,
+    "-i", audioPath,
+    "-c:v", "libx264",
+    "-tune", "stillimage",
+    "-r", "30",
+    "-pix_fmt", "yuv420p",
+    "-c:a", "aac",
+    "-shortest",
+    outMp4,
+  ]);
+}
+
+function setStage(jobId, stage) {
+  const j = jobs.get(jobId);
+  if (!j) return;
+  j.stage = stage;
+}
+
+async function processJob(jobId, jobDir, imagePath, plan) {
+  try {
+    setStage(jobId, "prepare");
+
+    if (!plan || !Array.isArray(plan.segments) || plan.segments.length === 0) {
+      throw new Error("Plan.segments boş veya yok");
+    }
+
+    // Build clips
+    const clipsDir = path.join(jobDir, "clips");
+    await fsp.mkdir(clipsDir, { recursive: true });
+
+    const wavs = [];
+    let idx = 0;
+
+    // Helper: add TTS clip (and normalize)
+    const addTtsClip = async (text, name) => {
+      const raw = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}_raw.wav`);
+      const norm = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}.wav`);
+      await ttsToWav(text, raw);
+      await normalizeToWav(raw, norm);
+      wavs.push(norm);
+    };
+
+    // Helper: add mp3 from url (download + normalize)
+    const addMp3UrlClip = async (url, name) => {
+      const mp3 = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}.mp3`);
+      const wav = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}.wav`);
+      await downloadToFile(url, mp3);
+      await normalizeToWav(mp3, wav);
+      wavs.push(wav);
+    };
+
+    setStage(jobId, "tts_intro");
+    if (plan.introText) await addTtsClip(plan.introText, "intro");
+
+    setStage(jobId, "tts_announce");
+    if (plan.surahAnnouncementText) await addTtsClip(plan.surahAnnouncementText, "announce");
+
+    setStage(jobId, "bismillah");
+    if (plan.useBismillahClip && plan.bismillahAudioUrl) {
+      await addMp3UrlClip(plan.bismillahAudioUrl, "bismillah_ar");
+    }
+
+    // Each segment: Arabic recitation mp3 + Turkish meal TTS
+    for (let i = 0; i < plan.segments.length; i++) {
+      const s = plan.segments[i];
+      if (!s || !s.arabicAudioUrl || !s.trText) continue;
+
+      setStage(jobId, `seg_${i + 1}_ar`);
+      await addMp3UrlClip(s.arabicAudioUrl, `ayah${s.ayah}_ar`);
+
+      setStage(jobId, `seg_${i + 1}_tr`);
+      // Meal TTS
+      await addTtsClip(s.trText, `ayah${s.ayah}_tr`);
+    }
+
+    setStage(jobId, "tts_outro");
+    if (plan.outroText) await addTtsClip(plan.outroText, "outro");
+
+    if (wavs.length === 0) throw new Error("Hiç audio clip üretilmedi");
+
+    // concat list file
+    setStage(jobId, "concat");
+    const listPath = path.join(jobDir, "list.txt");
+    const listBody = wavs.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join("\n");
+    await writeFileSafe(listPath, Buffer.from(listBody, "utf8"));
+
+    const concatWav = path.join(jobDir, "concat.wav");
+    await concatWavs(listPath, concatWav);
+
+    // guarantee 10 minutes
+    setStage(jobId, "pad_to_600");
+    const finalWav = path.join(jobDir, "final_600.wav");
+    await padOrTrimTo600s(concatWav, finalWav);
+
+    // encode audio
+    setStage(jobId, "encode_audio");
+    const audioM4a = path.join(jobDir, "audio.m4a");
+    await wavToM4a(finalWav, audioM4a);
+
+    // make mp4
+    setStage(jobId, "render_mp4");
+    const outMp4 = path.join(jobDir, "output.mp4");
+    await imagePlusAudioToMp4(imagePath, audioM4a, outMp4);
+
+    // sanity: duration
+    setStage(jobId, "verify");
+    const dur = await ffprobeDurationSec(outMp4);
+    if (dur < 590) {
+      // should not happen due to padding; if it does, fail loudly
+      throw new Error(`Video duration too short: ${dur.toFixed(2)}s`);
+    }
+
+    const j = jobs.get(jobId);
+    j.status = "done";
+    j.outputPath = outMp4;
+    j.stage = "done";
+  } catch (err) {
+    const j = jobs.get(jobId);
+    if (j) {
+      j.status = "error";
+      j.error = err?.message || String(err);
+      j.stage = "error";
+    }
+  }
+}
+
+// Health
+app.get("/health", (_, res) => res.json({ ok: true }));
+
+// START
+app.post("/render10min/start", upload.single("image"), async (req, res) => {
+  try {
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({ error: "OPENAI_API_KEY is missing" });
+    }
+    if (!req.file?.buffer) {
+      return res.status(400).json({ error: "Missing image file field: image" });
+    }
+    if (!req.body?.plan) {
+      return res.status(400).json({ error: "Missing plan field" });
+    }
+
+    let plan;
+    try {
+      plan = JSON.parse(req.body.plan);
+    } catch (e) {
+      return res.status(400).json({ error: "Plan JSON parse error" });
+    }
+
+    const jobId = uid();
+    const jobDir = path.join(os.tmpdir(), `render10min_${jobId}`);
+    await fsp.mkdir(jobDir, { recursive: true });
+
+    const imagePath = path.join(jobDir, "bg.png");
+    await writeFileSafe(imagePath, req.file.buffer);
+
+    jobs.set(jobId, {
+      status: "processing",
+      stage: "queued",
+      dir: jobDir,
+      createdAt: Date.now(),
+    });
+
+    // Fire-and-forget in same process
+    setImmediate(() => processJob(jobId, jobDir, imagePath, plan));
+
+    res.json({ jobId });
+  } catch (err) {
+    res.status(500).json({ error: err?.message || String(err) });
+  }
+});
+
+// STATUS
+app.get("/render10min/status/:jobId", (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ status: "error", error: "job_not_found" });
+
+  if (job.status === "error") return res.json({ status: "error", error: job.error || "unknown", stage: job.stage });
+  if (job.status === "done") return res.json({ status: "done", stage: job.stage });
+
+  return res.json({ status: "processing", stage: job.stage });
+});
+
+// RESULT
+app.get("/render10min/result/:jobId", async (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "job_not_found" });
+  if (job.status !== "done" || !job.outputPath) {
+    return res.status(409).json({ error: "job_not_done", status: job.status, stage: job.stage });
+  }
+
+  res.setHeader("Content-Type", "video/mp4");
+  res.setHeader("Content-Disposition", `attachment; filename="output_${req.params.jobId}.mp4"`);
+
+  const stream = fs.createReadStream(job.outputPath);
+  stream.on("error", (e) => res.status(500).end(e.message));
+  stream.pipe(res);
+});
+
+app.listen(PORT, () => {
+  console.log(`Render10min server running on :${PORT}`);
+});
