@@ -1,5 +1,5 @@
 {
-  "name": "ffmpeg-video-api",
+  "name": "render10min-server",
   "version": "1.0.0",
   "main": "server.js",
   "type": "commonjs",
@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "multer": "^1.4.5-lts.1"
+    "multer": "^1.4.5-lts.1",
+    "openai": "^4.0.0"
   }
 }
