@@ -2,22 +2,26 @@
 
 const express = require("express");
 const multer = require("multer");
-const { exec } = require("child_process");
+const { spawn, exec } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
+const { pipeline } = require("stream/promises");
+const { Readable } = require("stream");
 
 const app = express();
-const upload = multer({ dest: "uploads/" });
+const upload = multer({
+  dest: "uploads/",
+  limits: { fileSize: 25 * 1024 * 1024 } // 25MB
+});
 
-// Crash olsa bile Railway logs'a düşsün
 process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
 
 app.get("/", (req, res) => res.status(200).send("OK"));
 app.get("/health", (req, res) => res.json({ ok: true }));
-app.get("/render10min/health", (req, res) => res.json({ ok: true }));
+app.get("/render10min/health", (req, res) => res.json({ ok: true, route: "render10min" }));
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -30,72 +34,71 @@ function safeRmDir(dir) {
   try { if (dir && fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true }); } catch {}
 }
 
+function runSpawn(cmd, args, { input, timeoutMs } = {}) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"] });
+
+    let stderr = "";
+    p.stderr.on("data", (d) => (stderr += d.toString()));
+
+    let timer;
+    if (timeoutMs) {
+      timer = setTimeout(() => {
+        try { p.kill("SIGKILL"); } catch {}
+        reject(new Error(`${cmd} timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+    }
+
+    p.on("error", (err) => {
+      if (timer) clearTimeout(timer);
+      reject(err);
+    });
+
+    p.on("close", (code) => {
+      if (timer) clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`${cmd} exit ${code}: ${stderr.slice(-2000)}`));
+    });
+
+    if (input !== undefined) {
+      p.stdin.write(String(input));
+    }
+    p.stdin.end();
+  });
+}
+
 async function downloadToFile(url, outPath) {
   const resp = await fetch(url, { method: "GET" });
   if (!resp.ok) {
     const txt = await resp.text().catch(() => "");
-    throw new Error(`Download failed ${resp.status}: ${txt.slice(0, 200)}`);
+    throw new Error(`Download failed ${resp.status}: ${txt.slice(0, 300)}`);
   }
-  const buf = Buffer.from(await resp.arrayBuffer());
-  fs.writeFileSync(outPath, buf);
+  if (!resp.body) throw new Error("Download response has no body");
+
+  const nodeStream = Readable.fromWeb(resp.body);
+  await pipeline(nodeStream, fs.createWriteStream(outPath));
 }
 
-/**
- * OpenAI TTS -> mp3 dosyası üretir
- * Docs: POST /v1/audio/speech  model/voice/input (+ optional response_format, speed, instructions)
- */
-async function openAiTtsToFile(text, outPath) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error("Missing OPENAI_API_KEY env");
+async function turkishTtsToMp3(text, outMp3) {
+  const wav = outMp3.replace(/\.mp3$/i, ".wav");
+  const speed = process.env.ESPEAK_SPEED || "150"; // istersen Railway env ile değiştir
 
-  const model = process.env.OPENAI_TTS_MODEL || "gpt-4o-mini-tts";
-  const voice = process.env.OPENAI_TTS_VOICE || "alloy";
-  const speedRaw = process.env.OPENAI_TTS_SPEED;
-  const instructions = process.env.OPENAI_TTS_INSTRUCTIONS;
+  // espeak-ng stdin'den okuyup wav üretir
+  await runSpawn("espeak-ng", ["-v", "tr", "-s", speed, "-w", wav], {
+    input: (text && String(text).trim().length ? text : " "),
+    timeoutMs: 120000
+  });
 
-  const speed = speedRaw ? Number(speedRaw) : undefined;
+  // wav -> mp3
+  await new Promise((resolve, reject) => {
+    exec(
+      `ffmpeg -y -i "${wav}" -ac 2 -ar 44100 -b:a 128k "${outMp3}"`,
+      { maxBuffer: 1024 * 1024 * 20 },
+      (err, stdout, stderr) => (err ? reject(new Error((stderr || "").slice(-2000))) : resolve())
+    );
+  });
 
-  // 429/5xx retry
-  let attempt = 0;
-  while (true) {
-    attempt++;
-
-    const body = {
-      model,
-      voice,
-      input: String(text || "").trim().length ? String(text).trim() : " ",
-      response_format: "mp3",
-    };
-
-    if (typeof speed === "number" && !Number.isNaN(speed)) body.speed = speed;
-    if (instructions && String(instructions).trim().length) body.instructions = String(instructions);
-
-    const resp = await fetch("https://api.openai.com/v1/audio/speech", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-    });
-
-    if (resp.ok) {
-      const buf = Buffer.from(await resp.arrayBuffer());
-      fs.writeFileSync(outPath, buf);
-      return;
-    }
-
-    const errTxt = await resp.text().catch(() => "");
-    const retryable = resp.status === 429 || (resp.status >= 500 && resp.status <= 599);
-
-    if (retryable && attempt <= 6) {
-      const waitMs = Math.min(15000, 800 * Math.pow(2, attempt));
-      await sleep(waitMs);
-      continue;
-    }
-
-    throw new Error(`OpenAI TTS failed ${resp.status}: ${errTxt.slice(0, 500)}`);
-  }
+  safeUnlink(wav);
 }
 
 // -------------------- /render (eski) --------------------
@@ -137,29 +140,33 @@ app.post("/render", upload.fields([{ name: "image" }, { name: "audio" }]), (req,
 });
 
 // -------------------- render10min job sistemi --------------------
-const jobs = new Map(); // jobId -> {status, dir, output, error, createdAt, step, done, total}
+const jobs = new Map(); // jobId -> {status, dir, output, error, createdAt}
+const MAX_JOB_MS = Number(process.env.MAX_JOB_MS || 45 * 60 * 1000); // 45dk
 
 function buildJobsFromPlan(plan) {
   const arr = [];
   let order = 1;
   const pad = (n) => String(n).padStart(4, "0");
 
-  const addTTS = (tag, text) =>
-    arr.push({ kind: "tts", order: order++, fileName: `${pad(order - 1)}_${tag}.mp3`, text: text || "" });
+  function addTTS(tag, text) {
+    arr.push({ kind: "tts", order, fileName: `${pad(order)}_${tag}.mp3`, text: text || "" });
+    order++;
+  }
+  function addDL(tag, url) {
+    arr.push({ kind: "download", order, fileName: `${pad(order)}_${tag}.mp3`, url });
+    order++;
+  }
 
-  const addDL = (tag, url) =>
-    arr.push({ kind: "download", order: order++, fileName: `${pad(order - 1)}_${tag}.mp3`, url });
-
-  // TR intro
+  // önce TR intro
   addTTS("TR_INTRO", plan.introText);
 
-  // AR bismillah (varsa)
+  // sonra varsa AR bismillah
   if (plan.useBismillahClip && plan.bismillahAudioUrl) addDL("AR_BISM", plan.bismillahAudioUrl);
 
-  // TR sure anonsu
+  // sure anons TR
   addTTS("TR_SURE", plan.surahAnnouncementText);
 
-  // her ayet: AR sonra TR
+  // her ayet: AR mp3 -> TR TTS
   for (const s of plan.segments || []) {
     if (!s?.arabicAudioUrl) continue;
     addDL(`AR_${String(s.ayah).padStart(3, "0")}`, s.arabicAudioUrl);
@@ -178,25 +185,17 @@ async function runRender10MinJob(jobId, plan, imagePath, dir) {
 
   try {
     const work = buildJobsFromPlan(plan);
-    st.total = work.length;
-    st.done = 0;
-    st.step = "audio";
-
     const audioFiles = [];
 
-    // SIRALI çalıştır (rate limit'e girmesin)
     for (const j of work) {
       const out = path.join(dir, j.fileName);
-
       if (j.kind === "download") {
         await downloadToFile(j.url, out);
       } else {
-        await openAiTtsToFile(j.text, out);
-        await sleep(400);
+        await turkishTtsToMp3(j.text, out);
+        await sleep(250); // hafif throttle
       }
-
       audioFiles.push(out);
-      st.done++;
     }
 
     // concat list
@@ -207,9 +206,7 @@ async function runRender10MinJob(jobId, plan, imagePath, dir) {
       "utf8"
     );
 
-    st.step = "concat";
     const audioOut = path.join(dir, "all.mp3");
-
     await new Promise((resolve, reject) => {
       exec(
         `ffmpeg -y -f concat -safe 0 -i "${listPath}" -c:a libmp3lame -b:a 128k "${audioOut}"`,
@@ -218,7 +215,7 @@ async function runRender10MinJob(jobId, plan, imagePath, dir) {
       );
     });
 
-    st.step = "video";
+    // video
     const output = path.join(dir, "output.mp4");
     const zoomSpeed = 0.00025;
 
@@ -236,26 +233,21 @@ async function runRender10MinJob(jobId, plan, imagePath, dir) {
     st.status = "done";
     st.output = output;
     st.error = null;
-    st.step = "done";
   } catch (e) {
     st.status = "error";
     st.error = String(e?.message || e);
-    st.step = "error";
   }
 }
 
-// Job cleanup (memory leak olmasın)
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, st] of jobs.entries()) {
-    if (now - (st.createdAt || now) > 2 * 60 * 60 * 1000) { // 2 saat
-      safeRmDir(st.dir);
-      jobs.delete(id);
-    }
-  }
-}, 60 * 1000);
+// GET ile bakınca “POST kullan” desin diye:
+app.get("/render10min/start", (req, res) => res.status(405).json({ error: "Use POST /render10min/start" }));
 
 app.post("/render10min/start", upload.fields([{ name: "image", maxCount: 1 }]), async (req, res) => {
+  // tek job aynı anda (opsiyonel)
+  for (const v of jobs.values()) {
+    if (v.status === "processing") return res.status(429).json({ error: "A job is already processing" });
+  }
+
   const jobId = crypto.randomUUID();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `job-${jobId}-`));
 
@@ -266,21 +258,14 @@ app.post("/render10min/start", upload.fields([{ name: "image", maxCount: 1 }]), 
     const plan = JSON.parse(req.body.plan);
 
     const tempImage = req.files.image[0].path;
-    const imagePath = path.join(dir, "image.png");
+    const ext = path.extname(req.files.image[0].originalname || "") || ".png";
+    const imagePath = path.join(dir, `image${ext}`);
     fs.renameSync(tempImage, imagePath);
 
-    jobs.set(jobId, {
-      status: "processing",
-      dir,
-      output: null,
-      error: null,
-      createdAt: Date.now(),
-      step: "queued",
-      done: 0,
-      total: 0,
-    });
+    jobs.set(jobId, { status: "processing", dir, output: null, error: null, createdAt: Date.now() });
 
-    runRender10MinJob(jobId, plan, imagePath, dir);
+    // async başlat
+    setImmediate(() => runRender10MinJob(jobId, plan, imagePath, dir));
 
     return res.json({ jobId, status: "processing" });
   } catch (e) {
@@ -292,14 +277,13 @@ app.post("/render10min/start", upload.fields([{ name: "image", maxCount: 1 }]), 
 app.get("/render10min/status/:id", (req, res) => {
   const st = jobs.get(req.params.id);
   if (!st) return res.status(404).json({ error: "job not found" });
-  return res.json({
-    jobId: req.params.id,
-    status: st.status,
-    step: st.step,
-    done: st.done,
-    total: st.total,
-    error: st.error || null,
-  });
+
+  if (st.status === "processing" && (Date.now() - st.createdAt) > MAX_JOB_MS) {
+    st.status = "error";
+    st.error = "timeout";
+  }
+
+  return res.json({ jobId: req.params.id, status: st.status, error: st.error || null });
 });
 
 app.get("/render10min/result/:id", (req, res) => {
@@ -312,11 +296,6 @@ app.get("/render10min/result/:id", (req, res) => {
     safeRmDir(st.dir);
     jobs.delete(req.params.id);
   });
-});
-
-// Yanlış endpoint çağrılarını yakala
-app.post("/render10min", (req, res) => {
-  return res.status(410).json({ error: "Use POST /render10min/start then poll /status and /result" });
 });
 
 const PORT = process.env.PORT || 3000;
