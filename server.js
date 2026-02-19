@@ -91,7 +91,7 @@ async function downloadToFile(url, filePath) {
 async function ttsToWav(text, wavPath) {
   // Less robotic: gpt-4o-mini-tts + voice marin + wav output
   const response = await openai.audio.speech.create({
-    model: "gpt-4o-audio-preview", //"gpt-4o-mini-tts", // or snapshot: "gpt-4o-mini-tts-2025-12-15"
+    model: "gpt-4o-mini-tts", // or snapshot: "gpt-4o-mini-tts-2025-12-15"
     voice: "marin",
     input: text,
     instructions:
