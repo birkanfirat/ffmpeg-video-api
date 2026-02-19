@@ -91,13 +91,13 @@ async function downloadToFile(url, filePath) {
 async function ttsToWav(text, wavPath) {
   // Less robotic: gpt-4o-mini-tts + voice marin + wav output
   const response = await openai.audio.speech.create({
-    model: "gpt-4o-mini-tts", // or snapshot: "gpt-4o-mini-tts-2025-12-15"
+    model: "gpt-4o-audio-preview", //"gpt-4o-mini-tts", // or snapshot: "gpt-4o-mini-tts-2025-12-15"
     voice: "marin",
     input: text,
     instructions:
       "Türkçe doğal ve sıcak anlatım. Net diksiyon. Cümle sonlarında kısa duraksamalar. Robotik ton yok. Okuma hızı sakin.",
     response_format: "wav",
-    speed: 0.98,
+    speed: 0.90,
   });
 
   const buf = Buffer.from(await response.arrayBuffer());
