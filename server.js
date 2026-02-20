@@ -16,7 +16,7 @@ const crypto = require("crypto");
 const OpenAI = require("openai");
 
 // Node 18+ has global fetch. If not, uncomment next line:
-// const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+// const fetch = (...args) => import("node-fetch").then(({ default: fetch }) => fetch(...args));
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -92,15 +92,14 @@ async function downloadToFile(url, filePath) {
 }
 
 async function ttsToWav(text, wavPath) {
-  // Less robotic: gpt-4o-mini-tts + voice marin + wav output
   const response = await openai.audio.speech.create({
-    model: "gpt-4o-mini-tts", // or snapshot: "gpt-4o-mini-tts-2025-12-15"
+    model: "gpt-4o-mini-tts",
     voice: "marin",
     input: text,
     instructions:
       "Türkçe doğal ve sıcak anlatım. Net diksiyon. Cümle sonlarında kısa duraksamalar. Robotik ton yok. Okuma hızı sakin.",
     response_format: "wav",
-    speed: 0.90,
+    speed: 0.9,
   });
 
   const buf = Buffer.from(await response.arrayBuffer());
@@ -138,14 +137,16 @@ async function concatWavs(listFilePath, outWav) {
   ]);
 }
 
-// ✅ SESSİZLİK EKLEMEYİZ. Sadece gerekirse kırparız.
-async function trimIfTooLong(inWav, outWav, maxSec) {
+// ✅ Sondaki sessizliği kes (video sonunda boşluk kalmasın)
+async function trimTrailingSilence(inWav, outWav) {
   await runCmd("ffmpeg", [
     "-y",
     "-i",
     inWav,
     "-af",
-    `atrim=0:${maxSec},asetpts=N/SR/TB`,
+    // stop_threshold: sessizliği algılama eşiği (dB)
+    // stop_duration: kaç saniye sessizlikten sonra kesmeye başlasın
+    "silenceremove=stop_periods=-1:stop_duration=0.6:stop_threshold=-45dB,asetpts=N/SR/TB",
     "-ar",
     "48000",
     "-ac",
@@ -170,7 +171,6 @@ async function imagePlusAudioToMp4(imagePath, audioPath, outMp4) {
     "-i",
     audioPath,
 
-    // 4K gelirse bile 1080p/720p'e düşür (Railway'de şart)
     "-vf",
     "scale=1280:-2",
 
@@ -212,16 +212,14 @@ async function imagesPlusAudioToMp4(imagePaths, audioPath, outMp4) {
 
   // audio süresine göre her görselin ekranda kalma süresi
   const dur = await ffprobeDurationSec(audioPath);
-  const total = Math.max(1, dur || 600);
+  const total = Math.max(1, dur || 60);
   const per = total / imagePaths.length;
 
   // concat demuxer listesi
   const listPath = path.join(path.dirname(outMp4), "bg_list.txt");
   const esc = (p) => p.replace(/'/g, "'\\''");
 
-  const body = imagePaths
-    .map((p) => `file '${esc(p)}'\nduration ${per}`)
-    .join("\n");
+  const body = imagePaths.map((p) => `file '${esc(p)}'\nduration ${per}`).join("\n");
 
   // concat demuxer son dosyayı tekrar ister
   const last = imagePaths[imagePaths.length - 1];
@@ -292,14 +290,8 @@ async function processJob(jobId, jobDir, bgPaths, plan) {
 
     // Helper: add TTS clip (and normalize)
     const addTtsClip = async (text, name) => {
-      const raw = path.join(
-        clipsDir,
-        `${String(idx++).padStart(3, "0")}_${name}_raw.wav`
-      );
-      const norm = path.join(
-        clipsDir,
-        `${String(idx++).padStart(3, "0")}_${name}.wav`
-      );
+      const raw = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}_raw.wav`);
+      const norm = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}.wav`);
       await ttsToWav(text, raw);
       await normalizeToWav(raw, norm);
       wavs.push(norm);
@@ -307,14 +299,8 @@ async function processJob(jobId, jobDir, bgPaths, plan) {
 
     // Helper: add mp3 from url (download + normalize)
     const addMp3UrlClip = async (url, name) => {
-      const mp3 = path.join(
-        clipsDir,
-        `${String(idx++).padStart(3, "0")}_${name}.mp3`
-      );
-      const wav = path.join(
-        clipsDir,
-        `${String(idx++).padStart(3, "0")}_${name}.wav`
-      );
+      const mp3 = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}.mp3`);
+      const wav = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}.wav`);
       await downloadToFile(url, mp3);
       await normalizeToWav(mp3, wav);
       wavs.push(wav);
@@ -346,32 +332,25 @@ async function processJob(jobId, jobDir, bgPaths, plan) {
     setStage(jobId, "tts_outro");
     if (plan.outroText) await addTtsClip(plan.outroText, "outro");
 
+    // ✅ Kapanışta abone ol (intro ile aynı)
+    setStage(jobId, "tts_subscribe_outro");
+    if (plan.introText) await addTtsClip(plan.introText, "subscribe_outro");
+
     if (wavs.length === 0) throw new Error("Hiç audio clip üretilmedi");
 
     // concat list file
     setStage(jobId, "concat");
     const listPath = path.join(jobDir, "list.txt");
-    const listBody = wavs
-      .map((p) => `file '${p.replace(/'/g, "'\\''")}'`)
-      .join("\n");
+    const listBody = wavs.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join("\n");
     await writeFileSafe(listPath, Buffer.from(listBody, "utf8"));
 
     const concatWav = path.join(jobDir, "concat.wav");
     await concatWavs(listPath, concatWav);
 
-    // ✅ No padding. Only trim if too long.
-    setStage(jobId, "finalize_audio");
-
-    const concatDur = await ffprobeDurationSec(concatWav);
-
-    // max süre: plan.targetSec varsa onu kullan, yoksa 660 (11 dk) varsay
-    const maxSec = Math.max(60, Number(plan?.targetSec || 660));
-
-    let finalWav = concatWav;
-    if (concatDur > maxSec + 1) {
-      finalWav = path.join(jobDir, `final_trim_${maxSec}.wav`);
-      await trimIfTooLong(concatWav, finalWav, maxSec);
-    }
+    // ✅ trailing silence temizle (ayet kesmez, boşluğu keser)
+    setStage(jobId, "trim_silence");
+    const finalWav = path.join(jobDir, "final_nosilence.wav");
+    await trimTrailingSilence(concatWav, finalWav);
 
     // encode audio
     setStage(jobId, "encode_audio");
@@ -383,7 +362,7 @@ async function processJob(jobId, jobDir, bgPaths, plan) {
     const outMp4 = path.join(jobDir, "output.mp4");
     await imagesPlusAudioToMp4(bgPaths, audioM4a, outMp4);
 
-    // sanity: duration (artık 10dk şartı yok)
+    // sanity: duration
     setStage(jobId, "verify");
     const dur2 = await ffprobeDurationSec(outMp4);
     if (dur2 < 30) {
