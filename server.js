@@ -1,10 +1,8 @@
 /* server.js
  * Endpoints:
- *  POST /render10min/start   (multipart: bg1..bgN + plan JSON string)
+ *  POST /render10min/start   (multipart: bg1..bgN OR image + plan JSON string)
  *  GET  /render10min/status/:jobId   -> { status: "processing"|"done"|"error", stage?, error? }
  *  GET  /render10min/result/:jobId   -> mp4 file stream
- *
- * ✅ Bu sürümde 10dk sabitleme yok (pad/trim kaldırıldı).
  */
 
 const express = require("express");
@@ -17,9 +15,13 @@ const { spawn } = require("child_process");
 const crypto = require("crypto");
 const OpenAI = require("openai");
 
+// Node 18+ has global fetch. If not, uncomment next line:
+// const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// IMPORTANT: set OPENAI_API_KEY in Railway env vars
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // Multer: keep images in memory then write to job folder
@@ -90,8 +92,9 @@ async function downloadToFile(url, filePath) {
 }
 
 async function ttsToWav(text, wavPath) {
+  // Less robotic: gpt-4o-mini-tts + voice marin + wav output
   const response = await openai.audio.speech.create({
-    model: "gpt-4o-mini-tts",
+    model: "gpt-4o-mini-tts", // or snapshot: "gpt-4o-mini-tts-2025-12-15"
     voice: "marin",
     input: text,
     instructions:
@@ -104,7 +107,7 @@ async function ttsToWav(text, wavPath) {
   await writeFileSafe(wavPath, buf);
 }
 
-// Normalize any audio to 48kHz mono WAV PCM
+// Normalize any audio to 48kHz mono WAV PCM (concat sorunlarını bitirir)
 async function normalizeToWav(inPath, outWav) {
   await runCmd("ffmpeg", [
     "-y",
@@ -135,8 +138,65 @@ async function concatWavs(listFilePath, outWav) {
   ]);
 }
 
+// ✅ SESSİZLİK EKLEMEYİZ. Sadece gerekirse kırparız.
+async function trimIfTooLong(inWav, outWav, maxSec) {
+  await runCmd("ffmpeg", [
+    "-y",
+    "-i",
+    inWav,
+    "-af",
+    `atrim=0:${maxSec},asetpts=N/SR/TB`,
+    "-ar",
+    "48000",
+    "-ac",
+    "1",
+    "-c:a",
+    "pcm_s16le",
+    outWav,
+  ]);
+}
+
 async function wavToM4a(inWav, outM4a) {
   await runCmd("ffmpeg", ["-y", "-i", inWav, "-c:a", "aac", "-b:a", "192k", outM4a]);
+}
+
+async function imagePlusAudioToMp4(imagePath, audioPath, outMp4) {
+  await runCmd("ffmpeg", [
+    "-y",
+    "-loop",
+    "1",
+    "-i",
+    imagePath,
+    "-i",
+    audioPath,
+
+    // 4K gelirse bile 1080p/720p'e düşür (Railway'de şart)
+    "-vf",
+    "scale=1280:-2",
+
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "28",
+    "-tune",
+    "stillimage",
+    "-r",
+    "30",
+    "-pix_fmt",
+    "yuv420p",
+
+    "-c:a",
+    "aac",
+    "-b:a",
+    "160k",
+    "-movflags",
+    "+faststart",
+
+    "-shortest",
+    outMp4,
+  ]);
 }
 
 // N image => slideshow + audio
@@ -145,34 +205,17 @@ async function imagesPlusAudioToMp4(imagePaths, audioPath, outMp4) {
     throw new Error("No images provided");
   }
 
-  // 1 görsel varsa
+  // 1 görsel varsa eski davranış
   if (imagePaths.length === 1) {
-    await runCmd("ffmpeg", [
-      "-y",
-      "-loop", "1",
-      "-i", imagePaths[0],
-      "-i", audioPath,
-      "-vf", "scale=1280:-2",
-      "-c:v", "libx264",
-      "-preset", "veryfast",
-      "-crf", "28",
-      "-tune", "stillimage",
-      "-r", "30",
-      "-pix_fmt", "yuv420p",
-      "-c:a", "aac",
-      "-b:a", "160k",
-      "-movflags", "+faststart",
-      "-shortest",
-      outMp4,
-    ]);
-    return;
+    return imagePlusAudioToMp4(imagePaths[0], audioPath, outMp4);
   }
 
   // audio süresine göre her görselin ekranda kalma süresi
   const dur = await ffprobeDurationSec(audioPath);
-  const total = Math.max(1, dur || 1);
+  const total = Math.max(1, dur || 600);
   const per = total / imagePaths.length;
 
+  // concat demuxer listesi
   const listPath = path.join(path.dirname(outMp4), "bg_list.txt");
   const esc = (p) => p.replace(/'/g, "'\\''");
 
@@ -180,25 +223,43 @@ async function imagesPlusAudioToMp4(imagePaths, audioPath, outMp4) {
     .map((p) => `file '${esc(p)}'\nduration ${per}`)
     .join("\n");
 
+  // concat demuxer son dosyayı tekrar ister
   const last = imagePaths[imagePaths.length - 1];
   const finalBody = `${body}\nfile '${esc(last)}'\n`;
   await writeFileSafe(listPath, Buffer.from(finalBody, "utf8"));
 
   await runCmd("ffmpeg", [
     "-y",
-    "-f", "concat",
-    "-safe", "0",
-    "-i", listPath,
-    "-i", audioPath,
-    "-vf", "scale=1280:-2,format=yuv420p",
-    "-r", "30",
-    "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-crf", "28",
-    "-tune", "stillimage",
-    "-c:a", "aac",
-    "-b:a", "160k",
-    "-movflags", "+faststart",
+    "-f",
+    "concat",
+    "-safe",
+    "0",
+    "-i",
+    listPath,
+    "-i",
+    audioPath,
+
+    "-vf",
+    "scale=1280:-2,format=yuv420p",
+    "-r",
+    "30",
+
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "28",
+    "-tune",
+    "stillimage",
+
+    "-c:a",
+    "aac",
+    "-b:a",
+    "160k",
+    "-movflags",
+    "+faststart",
+
     "-shortest",
     outMp4,
   ]);
@@ -222,23 +283,38 @@ async function processJob(jobId, jobDir, bgPaths, plan) {
       throw new Error("BG paths boş");
     }
 
+    // Build clips
     const clipsDir = path.join(jobDir, "clips");
     await fsp.mkdir(clipsDir, { recursive: true });
 
     const wavs = [];
     let idx = 0;
 
+    // Helper: add TTS clip (and normalize)
     const addTtsClip = async (text, name) => {
-      const raw = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}_raw.wav`);
-      const norm = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}.wav`);
+      const raw = path.join(
+        clipsDir,
+        `${String(idx++).padStart(3, "0")}_${name}_raw.wav`
+      );
+      const norm = path.join(
+        clipsDir,
+        `${String(idx++).padStart(3, "0")}_${name}.wav`
+      );
       await ttsToWav(text, raw);
       await normalizeToWav(raw, norm);
       wavs.push(norm);
     };
 
+    // Helper: add mp3 from url (download + normalize)
     const addMp3UrlClip = async (url, name) => {
-      const mp3 = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}.mp3`);
-      const wav = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}.wav`);
+      const mp3 = path.join(
+        clipsDir,
+        `${String(idx++).padStart(3, "0")}_${name}.mp3`
+      );
+      const wav = path.join(
+        clipsDir,
+        `${String(idx++).padStart(3, "0")}_${name}.wav`
+      );
       await downloadToFile(url, mp3);
       await normalizeToWav(mp3, wav);
       wavs.push(wav);
@@ -255,6 +331,7 @@ async function processJob(jobId, jobDir, bgPaths, plan) {
       await addMp3UrlClip(plan.bismillahAudioUrl, "bismillah_ar");
     }
 
+    // Each segment: Arabic recitation mp3 + Turkish meal TTS
     for (let i = 0; i < plan.segments.length; i++) {
       const s = plan.segments[i];
       if (!s || !s.arabicAudioUrl || !s.trText) continue;
@@ -271,23 +348,42 @@ async function processJob(jobId, jobDir, bgPaths, plan) {
 
     if (wavs.length === 0) throw new Error("Hiç audio clip üretilmedi");
 
+    // concat list file
     setStage(jobId, "concat");
     const listPath = path.join(jobDir, "list.txt");
-    const listBody = wavs.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join("\n");
+    const listBody = wavs
+      .map((p) => `file '${p.replace(/'/g, "'\\''")}'`)
+      .join("\n");
     await writeFileSafe(listPath, Buffer.from(listBody, "utf8"));
 
     const concatWav = path.join(jobDir, "concat.wav");
     await concatWavs(listPath, concatWav);
 
-    // ✅ SABİT 600sn KALDIRILDI: concat.wav neyse o
+    // ✅ No padding. Only trim if too long.
+    setStage(jobId, "finalize_audio");
+
+    const concatDur = await ffprobeDurationSec(concatWav);
+
+    // max süre: plan.targetSec varsa onu kullan, yoksa 660 (11 dk) varsay
+    const maxSec = Math.max(60, Number(plan?.targetSec || 660));
+
+    let finalWav = concatWav;
+    if (concatDur > maxSec + 1) {
+      finalWav = path.join(jobDir, `final_trim_${maxSec}.wav`);
+      await trimIfTooLong(concatWav, finalWav, maxSec);
+    }
+
+    // encode audio
     setStage(jobId, "encode_audio");
     const audioM4a = path.join(jobDir, "audio.m4a");
-    await wavToM4a(concatWav, audioM4a);
+    await wavToM4a(finalWav, audioM4a);
 
+    // make mp4 (slideshow)
     setStage(jobId, "render_mp4");
     const outMp4 = path.join(jobDir, "output.mp4");
     await imagesPlusAudioToMp4(bgPaths, audioM4a, outMp4);
 
+    // sanity: duration (artık 10dk şartı yok)
     setStage(jobId, "verify");
     const dur2 = await ffprobeDurationSec(outMp4);
     if (dur2 < 30) {
@@ -311,6 +407,8 @@ async function processJob(jobId, jobDir, bgPaths, plan) {
 // Health
 app.get("/health", (_, res) => res.json({ ok: true }));
 
+// START
+// multipart: bg1..bgN (recommended) OR image, plus plan (JSON string)
 app.post("/render10min/start", upload.any(), async (req, res) => {
   try {
     if (!process.env.OPENAI_API_KEY) {
@@ -333,6 +431,10 @@ app.post("/render10min/start", upload.any(), async (req, res) => {
       return res.status(400).json({ error: "Plan JSON parse error" });
     }
 
+    // Accept either:
+    // - fields named bg1, bg2, ... bgN
+    // - or a single field named image
+    // Sort bg fields by numeric suffix
     const valid = files
       .filter((f) => f?.buffer && typeof f.fieldname === "string")
       .filter((f) => f.fieldname === "image" || /^bg\d+$/i.test(f.fieldname))
@@ -352,6 +454,7 @@ app.post("/render10min/start", upload.any(), async (req, res) => {
     const jobDir = path.join(os.tmpdir(), `render10min_${jobId}`);
     await fsp.mkdir(jobDir, { recursive: true });
 
+    // Write all BGs into job folder
     const bgPaths = [];
     for (let i = 0; i < valid.length; i++) {
       const p = path.join(jobDir, `bg_${String(i + 1).padStart(2, "0")}.png`);
@@ -366,6 +469,7 @@ app.post("/render10min/start", upload.any(), async (req, res) => {
       createdAt: Date.now(),
     });
 
+    // Fire-and-forget in same process
     setImmediate(() => processJob(jobId, jobDir, bgPaths, plan));
 
     res.json({ jobId, bgCount: bgPaths.length });
@@ -374,6 +478,7 @@ app.post("/render10min/start", upload.any(), async (req, res) => {
   }
 });
 
+// STATUS
 app.get("/render10min/status/:jobId", (req, res) => {
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ status: "error", error: "job_not_found" });
@@ -385,6 +490,7 @@ app.get("/render10min/status/:jobId", (req, res) => {
   return res.json({ status: "processing", stage: job.stage });
 });
 
+// RESULT
 app.get("/render10min/result/:jobId", async (req, res) => {
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: "job_not_found" });
