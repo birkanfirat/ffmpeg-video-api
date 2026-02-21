@@ -148,7 +148,7 @@ async function imagesPlusAudioToMp4(imagePaths, audioPath, outMp4, plan = {}, ct
   const motion = fx.motion !== false;         // default true
   const sparks = fx.sparks !== false;         // default true
   const ctaEnabled = fx.cta !== false;        // default true
-  const ctaDurationSec = Math.max(3, Number(fx.ctaDurationSec || 6));
+  const ctaDurationSec = Math.max(2, Number(fx.ctaDurationSec || 4)); // ✅ default 4
 
   const fps = 30;
   const dur = await ffprobeDurationSec(audioPath);
@@ -174,7 +174,6 @@ async function imagesPlusAudioToMp4(imagePaths, audioPath, outMp4, plan = {}, ct
     args.push("-loop", "1", "-i", ctaPath);
   }
 
-  // --- filter_complex ---
   const filters = [];
 
   // per-image segment with Ken Burns
@@ -183,7 +182,6 @@ async function imagesPlusAudioToMp4(imagePaths, audioPath, outMp4, plan = {}, ct
       `scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,format=rgba`;
 
     if (motion) {
-      // gentle zoom-in (no aggressive pan, stabil)
       filters.push(
         `[${i}:v]${common},` +
         `zoompan=z='min(zoom+0.0008,1.08)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':` +
@@ -203,9 +201,8 @@ async function imagesPlusAudioToMp4(imagePaths, audioPath, outMp4, plan = {}, ct
 
   let last = "base";
 
-  // Sparks / embers overlay (lightweight)
+  // Sparks / embers overlay
   if (sparks) {
-    // Random speckles + slight blur => ember-like particles
     filters.push(
       `nullsrc=s=1280x720:d=${total.toFixed(3)},format=rgba,` +
       `noise=alls=30:allf=t+u,format=gray,` +
@@ -214,29 +211,58 @@ async function imagesPlusAudioToMp4(imagePaths, audioPath, outMp4, plan = {}, ct
       `format=rgba,` +
       `colorchannelmixer=rr=1:gg=0.65:bb=0.25:aa=0.22[sp]`
     );
-
     filters.push(`[${last}][sp]overlay=shortest=1:format=auto[vfx]`);
     last = "vfx";
   }
 
-  // CTA overlay at the end (fade in/out)
+  // ✅ CTA overlay (hem başta hem sonda)
   if (ctaEnabled && ctaIndex !== null) {
-    const fade = 0.5;
-    const start = Math.max(0, total - ctaDurationSec);
-    const outStart = Math.max(0, total - fade);
+    const fade = 0.35;
 
+    // başta: 0..ctaDurationSec
+    const startIn = 0;
+    const startOut = Math.max(0, ctaDurationSec - fade);
+
+    // sonda: total-ctaDurationSec .. total
+    const endStart = Math.max(0, total - ctaDurationSec);
+    const endOut = Math.max(0, total - fade);
+
+    // CTA'yı ikiye böl (aynı inputtan 2 overlay stream)
     filters.push(
-      `[${ctaIndex}:v]format=rgba,` +
-      `scale=1280:-1,` +
-      `fade=t=in:st=${start.toFixed(3)}:d=${fade}:alpha=1,` +
-      `fade=t=out:st=${outStart.toFixed(3)}:d=${fade}:alpha=1,` +
-      `trim=duration=${total.toFixed(3)},setpts=PTS-STARTPTS[cta]`
+      `[${ctaIndex}:v]format=rgba,scale=1280:-1,split=2[ctaA][ctaB]`
     );
 
-    // bottom center
+    // CTA A (baş)
     filters.push(
-      `[${last}][cta]overlay=x=(W-w)/2:y=H-h-40:shortest=1:format=auto[vout]`
+      `[ctaA]` +
+      `fade=t=in:st=${startIn.toFixed(3)}:d=${fade}:alpha=1,` +
+      `fade=t=out:st=${startOut.toFixed(3)}:d=${fade}:alpha=1,` +
+      `trim=duration=${ctaDurationSec.toFixed(3)},setpts=PTS-STARTPTS[cta_start]`
     );
+
+    // CTA B (son)
+    filters.push(
+      `[ctaB]` +
+      `fade=t=in:st=${endStart.toFixed(3)}:d=${fade}:alpha=1,` +
+      `fade=t=out:st=${endOut.toFixed(3)}:d=${fade}:alpha=1,` +
+      `trim=duration=${total.toFixed(3)},setpts=PTS-STARTPTS[cta_end_full]`
+    );
+
+    // CTA end’i “total timeline” üzerinde doğru zamanlamaya oturt:
+    // -> enable ile sadece sondaki aralıkta görünür.
+    // alt-orta konum: y = H - h - 40
+    filters.push(
+      `[${last}][cta_start]overlay=x=(W-w)/2:y=H-h-40:enable='between(t,0,${ctaDurationSec.toFixed(
+        3
+      )})':format=auto[tmp1]`
+    );
+
+    filters.push(
+      `[tmp1][cta_end_full]overlay=x=(W-w)/2:y=H-h-40:enable='between(t,${endStart.toFixed(
+        3
+      )},${total.toFixed(3)})':format=auto[vout]`
+    );
+
     last = "vout";
   } else {
     filters.push(`[${last}]format=rgba[vout]`);
