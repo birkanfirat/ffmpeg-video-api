@@ -1,5 +1,5 @@
 {
-  "name": "render10min-server",
+  "name": "ffmpeg-video-api",
   "version": "1.0.0",
   "main": "server.js",
   "type": "commonjs",
@@ -7,6 +7,7 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "@google-cloud/text-to-speech": "^6.3.0",
     "express": "^4.19.2",
     "multer": "^1.4.5-lts.1",
     "openai": "^4.0.0"
