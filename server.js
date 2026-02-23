@@ -139,145 +139,90 @@ async function wavToM4a(inWav, outM4a) {
  * - plan.videoFx (optional):
  *    { motion: true/false, sparks: true/false, cta: true/false, ctaDurationSec: 6 }
  */
-async function imagesPlusAudioToMp4(imagePaths, audioPath, outMp4, plan = {}, ctaPath = null) {
+async function imagesPlusAudioToMp4(imagePaths, audioPath, outMp4) {
   if (!Array.isArray(imagePaths) || imagePaths.length === 0) {
     throw new Error("No images provided");
   }
 
-  const fx = plan.videoFx || {};
-  const motion = fx.motion !== false;         // default true
-  const sparks = fx.sparks !== false;         // default true
-  const ctaEnabled = fx.cta !== false;        // default true
-  const ctaDurationSec = Math.max(2, Number(fx.ctaDurationSec || 4)); // ✅ default 4
-
+  const W = 1920;
+  const H = 1080;
   const fps = 30;
+
+  // audio süresi
   const dur = await ffprobeDurationSec(audioPath);
   const total = Math.max(1, dur || 60);
-  const per = total / imagePaths.length;
-  const framesPer = Math.max(1, Math.round(per * fps));
+
+  const n = imagePaths.length;
+  const per = total / n;
 
   const args = ["-y"];
 
-  // image inputs (infinite looped)
-  for (const p of imagePaths) {
-    args.push("-loop", "1", "-i", p);
+  // Her görseli ayrı input yapıyoruz (Ken Burns reset + daha iyi sonuç)
+  for (let i = 0; i < n; i++) {
+    // küçük pay bırak: rounding yüzünden video < audio olmasın
+    args.push("-loop", "1", "-t", String(per + 0.2), "-i", imagePaths[i]);
   }
 
-  // audio input
-  const audioIndex = imagePaths.length;
+  // audio input en sonda
   args.push("-i", audioPath);
 
-  // optional CTA input
-  let ctaIndex = null;
-  if (ctaEnabled && ctaPath) {
-    ctaIndex = audioIndex + 1;
-    args.push("-loop", "1", "-i", ctaPath);
+  const framePer = Math.ceil(per * fps); // video >= audio garanti
+
+  const parts = [];
+
+  // Ken Burns per image
+  for (let i = 0; i < n; i++) {
+    parts.push(
+      `[${i}:v]` +
+        `scale=${W}:${H}:force_original_aspect_ratio=increase,` +
+        `crop=${W}:${H},` +
+        `fps=${fps},` +
+        // zoompan (ufak hareket)
+        `zoompan=` +
+          `z='min(zoom+0.0007,1.08)':` +
+          `x='iw/2-(iw/zoom/2)':` +
+          `y='ih/2-(ih/zoom/2)':` +
+          `d=${framePer}:s=${W}x${H},` +
+        `setsar=1,format=yuv420p` +
+      `[v${i}]`
+    );
   }
 
-  const filters = [];
+  // concat
+  const concatInputs = Array.from({ length: n }, (_, i) => `[v${i}]`).join("");
+  parts.push(`${concatInputs}concat=n=${n}:v=1:a=0[bg]`);
 
-  // per-image segment with Ken Burns
-  for (let i = 0; i < imagePaths.length; i++) {
-    const common =
-      `scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,format=rgba`;
+  // --- Spark/particle layer üret (ffmpeg internal) ---
+  // mask: noise -> threshold -> blur
+  parts.push(
+    `nullsrc=s=${W}x${H}:d=${total},` +
+    `noise=alls=40:allf=t+u,` +
+    `format=gray,` +
+    `lut=y='if(gt(val,253),255,0)',` +
+    `boxblur=2:1[mask]`
+  );
 
-    if (motion) {
-      filters.push(
-        `[${i}:v]${common},` +
-        `zoompan=z='min(zoom+0.0008,1.08)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':` +
-        `d=${framesPer}:s=1280x720:fps=${fps},` +
-        `trim=duration=${per.toFixed(3)},setpts=PTS-STARTPTS[v${i}]`
-      );
-    } else {
-      filters.push(
-        `[${i}:v]${common},trim=duration=${per.toFixed(3)},setpts=PTS-STARTPTS[v${i}]`
-      );
-    }
-  }
+  // white layer + alpha mask => sadece “parlayan noktalar”
+  parts.push(`color=c=white:s=${W}x${H}:d=${total}[white]`);
+  parts.push(`[white][mask]alphamerge,format=rgba,colorchannelmixer=aa=0.28[sparks]`);
 
-  // concat all segments
-  const vrefs = imagePaths.map((_, i) => `[v${i}]`).join("");
-  filters.push(`${vrefs}concat=n=${imagePaths.length}:v=1:a=0,format=rgba[base]`);
+  // overlay sparks
+  parts.push(`[bg][sparks]overlay=shortest=1:format=auto,format=yuv420p[vout]`);
 
-  let last = "base";
+  const filter = parts.join(";");
 
-  // Sparks / embers overlay
-  if (sparks) {
-    filters.push(
-      `nullsrc=s=1280x720:d=${total.toFixed(3)},format=rgba,` +
-      `noise=alls=30:allf=t+u,format=gray,` +
-      `lut='if(gt(val,252),255,0)',` +
-      `gblur=sigma=1.0:steps=2,` +
-      `format=rgba,` +
-      `colorchannelmixer=rr=1:gg=0.65:bb=0.25:aa=0.22[sp]`
-    );
-    filters.push(`[${last}][sp]overlay=shortest=1:format=auto[vfx]`);
-    last = "vfx";
-  }
-
-  // ✅ CTA overlay (hem başta hem sonda)
-  if (ctaEnabled && ctaIndex !== null) {
-    const fade = 0.35;
-
-    // başta: 0..ctaDurationSec
-    const startIn = 0;
-    const startOut = Math.max(0, ctaDurationSec - fade);
-
-    // sonda: total-ctaDurationSec .. total
-    const endStart = Math.max(0, total - ctaDurationSec);
-    const endOut = Math.max(0, total - fade);
-
-    // CTA'yı ikiye böl (aynı inputtan 2 overlay stream)
-    filters.push(
-      `[${ctaIndex}:v]format=rgba,scale=1280:-1,split=2[ctaA][ctaB]`
-    );
-
-    // CTA A (baş)
-    filters.push(
-      `[ctaA]` +
-      `fade=t=in:st=${startIn.toFixed(3)}:d=${fade}:alpha=1,` +
-      `fade=t=out:st=${startOut.toFixed(3)}:d=${fade}:alpha=1,` +
-      `trim=duration=${ctaDurationSec.toFixed(3)},setpts=PTS-STARTPTS[cta_start]`
-    );
-
-    // CTA B (son)
-    filters.push(
-      `[ctaB]` +
-      `fade=t=in:st=${endStart.toFixed(3)}:d=${fade}:alpha=1,` +
-      `fade=t=out:st=${endOut.toFixed(3)}:d=${fade}:alpha=1,` +
-      `trim=duration=${total.toFixed(3)},setpts=PTS-STARTPTS[cta_end_full]`
-    );
-
-    // CTA end’i “total timeline” üzerinde doğru zamanlamaya oturt:
-    // -> enable ile sadece sondaki aralıkta görünür.
-    // alt-orta konum: y = H - h - 40
-    filters.push(
-      `[${last}][cta_start]overlay=x=(W-w)/2:y=H-h-40:enable='between(t,0,${ctaDurationSec.toFixed(
-        3
-      )})':format=auto[tmp1]`
-    );
-
-    filters.push(
-      `[tmp1][cta_end_full]overlay=x=(W-w)/2:y=H-h-40:enable='between(t,${endStart.toFixed(
-        3
-      )},${total.toFixed(3)})':format=auto[vout]`
-    );
-
-    last = "vout";
-  } else {
-    filters.push(`[${last}]format=rgba[vout]`);
-    last = "vout";
-  }
+  // audio input index = n
+  const aIdx = n;
 
   args.push(
-    "-filter_complex", filters.join(";"),
-    "-map", `[${last}]`,
-    "-map", `${audioIndex}:a`,
+    "-filter_complex", filter,
+    "-map", "[vout]",
+    "-map", `${aIdx}:a`,
     "-c:v", "libx264",
     "-preset", "veryfast",
-    "-crf", "28",
-    "-r", String(fps),
+    "-crf", "22",
     "-pix_fmt", "yuv420p",
+    "-r", String(fps),
     "-c:a", "aac",
     "-b:a", "160k",
     "-movflags", "+faststart",
