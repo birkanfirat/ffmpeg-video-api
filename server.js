@@ -13,13 +13,12 @@ const fs = require("fs");
 const fsp = require("fs/promises");
 const { spawn } = require("child_process");
 const crypto = require("crypto");
-const OpenAI = require("openai");
+
+// ✅ Google Cloud TTS
+const textToSpeech = require("@google-cloud/text-to-speech");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-// IMPORTANT: set OPENAI_API_KEY in Railway env vars
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // Multer: keep images in memory then write to job folder
 const upload = multer({
@@ -75,18 +74,70 @@ async function downloadToFile(url, filePath) {
   await writeFileSafe(filePath, Buffer.from(ab));
 }
 
-async function ttsToWav(text, wavPath) {
-  const response = await openai.audio.speech.create({
-    model: "gpt-4o-mini-tts",
-    voice: "marin",
-    input: text,
-    instructions:
-      "Türkçe doğal ve sıcak anlatım. Net diksiyon. Cümle sonlarında kısa duraksamalar. Robotik ton yok. Okuma hızı sakin.",
-    response_format: "wav",
-    speed: 0.9,
-  });
+// ✅ Google TTS client (service account from base64 env)
+function createGoogleTtsClient() {
+  const b64 = process.env.GCP_TTS_KEY_B64;
+  if (!b64) {
+    throw new Error(
+      "GCP_TTS_KEY_B64 is missing. Put your Google service-account JSON as base64 into env."
+    );
+  }
+  const jsonStr = Buffer.from(b64, "base64").toString("utf8");
+  let creds;
+  try {
+    creds = JSON.parse(jsonStr);
+  } catch (e) {
+    throw new Error("GCP_TTS_KEY_B64 is not valid JSON base64");
+  }
+  return new textToSpeech.TextToSpeechClient({ credentials: creds });
+}
 
-  const buf = Buffer.from(await response.arrayBuffer());
+const gcpTtsClient = (() => {
+  try {
+    return createGoogleTtsClient();
+  } catch (e) {
+    // server start’ta patlatmak yerine, /start içinde kontrol edeceğiz
+    return null;
+  }
+})();
+
+// ✅ Google TTS -> WAV (LINEAR16)
+async function ttsToWav(text, wavPath) {
+  const client = gcpTtsClient || createGoogleTtsClient();
+
+  const voiceName = process.env.GCP_TTS_VOICE || "tr-TR-Wavenet-E";
+  const speakingRate = Number(process.env.GCP_TTS_SPEAKING_RATE || "0.92");
+  const pitch = Number(process.env.GCP_TTS_PITCH || "0");
+
+  // Google TTS’nin stabil çalışması için: çok uzun metinleri parça parça okumak iyi olur.
+  // Senin textlerin (meal) genelde makul ama yine de garanti olsun:
+  const safeText = String(text || "").trim();
+  if (!safeText) throw new Error("ttsToWav: empty text");
+
+  const request = {
+    input: { text: safeText },
+    voice: {
+      languageCode: "tr-TR",
+      name: voiceName,
+    },
+    audioConfig: {
+      audioEncoding: "LINEAR16", // ✅ WAV PCM
+      speakingRate: Number.isFinite(speakingRate) ? speakingRate : 0.92,
+      pitch: Number.isFinite(pitch) ? pitch : 0,
+      // effectsProfileId: ["telephony-class-application"], // istemezsen kapalı kalsın
+    },
+  };
+
+  const [response] = await client.synthesizeSpeech(request);
+  if (!response?.audioContent) {
+    throw new Error("Google TTS returned empty audioContent");
+  }
+
+  // audioContent is Buffer (or Uint8Array)
+  const buf = Buffer.isBuffer(response.audioContent)
+    ? response.audioContent
+    : Buffer.from(response.audioContent);
+
   await writeFileSafe(wavPath, buf);
 }
 
@@ -135,9 +186,6 @@ async function wavToM4a(inWav, outM4a) {
  * ✅ Ken Burns + Sparks + Optional CTA overlay (end)
  * - imagePaths: [bg_01.png, bg_02.png, ...]
  * - audioPath: audio.m4a
- * - ctaPath: optional png (like/subscribe banner)
- * - plan.videoFx (optional):
- *    { motion: true/false, sparks: true/false, cta: true/false, ctaDurationSec: 6 }
  */
 async function imagesPlusAudioToMp4(imagePaths, audioPath, outMp4) {
   if (!Array.isArray(imagePaths) || imagePaths.length === 0) {
@@ -157,16 +205,15 @@ async function imagesPlusAudioToMp4(imagePaths, audioPath, outMp4) {
 
   const args = ["-y"];
 
-  // Her görseli ayrı input yapıyoruz (Ken Burns reset + daha iyi sonuç)
+  // Her görseli ayrı input yapıyoruz
   for (let i = 0; i < n; i++) {
-    // küçük pay bırak: rounding yüzünden video < audio olmasın
     args.push("-loop", "1", "-t", String(per + 0.2), "-i", imagePaths[i]);
   }
 
   // audio input en sonda
   args.push("-i", audioPath);
 
-  const framePer = Math.ceil(per * fps); // video >= audio garanti
+  const framePer = Math.ceil(per * fps);
 
   const parts = [];
 
@@ -177,7 +224,6 @@ async function imagesPlusAudioToMp4(imagePaths, audioPath, outMp4) {
         `scale=${W}:${H}:force_original_aspect_ratio=increase,` +
         `crop=${W}:${H},` +
         `fps=${fps},` +
-        // zoompan (ufak hareket)
         `zoompan=` +
           `z='min(zoom+0.0007,1.08)':` +
           `x='iw/2-(iw/zoom/2)':` +
@@ -192,8 +238,7 @@ async function imagesPlusAudioToMp4(imagePaths, audioPath, outMp4) {
   const concatInputs = Array.from({ length: n }, (_, i) => `[v${i}]`).join("");
   parts.push(`${concatInputs}concat=n=${n}:v=1:a=0[bg]`);
 
-  // --- Spark/particle layer üret (ffmpeg internal) ---
-  // mask: noise -> threshold -> blur
+  // sparks
   parts.push(
     `nullsrc=s=${W}x${H}:d=${total},` +
     `noise=alls=40:allf=t+u,` +
@@ -202,16 +247,13 @@ async function imagesPlusAudioToMp4(imagePaths, audioPath, outMp4) {
     `boxblur=2:1[mask]`
   );
 
-  // white layer + alpha mask => sadece “parlayan noktalar”
   parts.push(`color=c=white:s=${W}x${H}:d=${total}[white]`);
   parts.push(`[white][mask]alphamerge,format=rgba,colorchannelmixer=aa=0.28[sparks]`);
 
-  // overlay sparks
   parts.push(`[bg][sparks]overlay=shortest=1:format=auto,format=yuv420p[vout]`);
 
   const filter = parts.join(";");
 
-  // audio input index = n
   const aIdx = n;
 
   args.push(
@@ -244,7 +286,6 @@ function setStage(jobId, stage) {
 // 2) local file assets/cta.png
 // 3) env CTA_IMAGE_URL (download)
 async function resolveCta(jobDir, files) {
-  // 1) multipart cta
   const ctaFile = (files || []).find((f) => String(f.fieldname).toLowerCase() === "cta" && f.buffer);
   if (ctaFile) {
     const p = path.join(jobDir, "cta.png");
@@ -252,14 +293,12 @@ async function resolveCta(jobDir, files) {
     return p;
   }
 
-  // 2) local asset
   const local = path.join(process.cwd(), "assets", "cta.png");
   try {
     await fsp.access(local, fs.constants.R_OK);
     return local;
   } catch (_) {}
 
-  // 3) env url
   const url = process.env.CTA_IMAGE_URL;
   if (url) {
     const p = path.join(jobDir, "cta_download.png");
@@ -333,10 +372,6 @@ async function processJob(jobId, jobDir, bgPaths, plan, ctaPath) {
     setStage(jobId, "tts_outro");
     if (plan.outroText) await addTtsClip(plan.outroText, "outro");
 
-    // ❌ Eski: kapanışta tekrar “abone ol” TTS
-    // ✅ Yeni: CTA görseli video üstüne bindirilecek (cta overlay)
-    // (Burada ekstra TTS eklemiyoruz)
-
     if (wavs.length === 0) throw new Error("Hiç audio clip üretilmedi");
 
     // concat list file
@@ -358,7 +393,7 @@ async function processJob(jobId, jobDir, bgPaths, plan, ctaPath) {
     const audioM4a = path.join(jobDir, "audio.m4a");
     await wavToM4a(finalWav, audioM4a);
 
-    // make mp4 (Ken Burns + sparks + CTA)
+    // make mp4
     setStage(jobId, "render_mp4");
     const outMp4 = path.join(jobDir, "output.mp4");
     await imagesPlusAudioToMp4(bgPaths, audioM4a, outMp4, plan, ctaPath);
@@ -388,8 +423,9 @@ app.get("/health", (_, res) => res.json({ ok: true }));
 // START
 app.post("/render10min/start", upload.any(), async (req, res) => {
   try {
-    if (!process.env.OPENAI_API_KEY) {
-      return res.status(500).json({ error: "OPENAI_API_KEY is missing" });
+    // ✅ Google creds check early
+    if (!process.env.GCP_TTS_KEY_B64) {
+      return res.status(500).json({ error: "GCP_TTS_KEY_B64 is missing" });
     }
 
     const files = Array.isArray(req.files) ? req.files : [];
