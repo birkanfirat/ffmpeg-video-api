@@ -248,34 +248,45 @@ async function ttsTrToWav(text, wavPath) {
 
 // ---- single image + subtle zoom in/out + optional CTA at end ----
 async function imagePlusAudioToMp4Single(bgPath, audioPath, outMp4, plan = {}, ctaPath = null) {
-  // Output settings (env ile kontrol edilebilir)
-  const W = Number(process.env.VIDEO_W || plan.videoW || 1920);
-  const H = Number(process.env.VIDEO_H || plan.videoH || 1080);
-  const fps = Number(process.env.VIDEO_FPS || plan.videoFps || 30);
+  // Railway-safe defaults
+  const W = Number(process.env.VIDEO_W || plan.videoW || 1280);
+  const H = Number(process.env.VIDEO_H || plan.videoH || 720);
+  const fps = Number(process.env.VIDEO_FPS || plan.videoFps || 25);
 
-  // Boyut kontrolü (asıl kritik kısım)
-  const preset = process.env.VIDEO_PRESET || plan.videoPreset || "veryfast"; // ❌ ultrafast kullanma
-  const crf = Number(process.env.VIDEO_CRF || plan.videoCrf || 28);          // 26-30 arası iyi
-  const maxrate = process.env.VIDEO_MAXRATE || plan.videoMaxrate || "2500k"; // 10 dk ~ 180-220MB
-  const bufsize = process.env.VIDEO_BUFSIZE || plan.videoBufsize || "5000k";
+  // CPU'yu düşür: preset + thread limit (SIGKILL'in #1 sebebi bu)
+  const preset = process.env.VIDEO_PRESET || plan.videoPreset || "ultrafast"; // ✅ CPU düşük
+  const crf = Number(process.env.VIDEO_CRF || plan.videoCrf || 28);
+
+  // Boyut kontrolü (cap): 10dk için makul
+  const maxrate = process.env.VIDEO_MAXRATE || plan.videoMaxrate || "2000k";
+  const bufsize = process.env.VIDEO_BUFSIZE || plan.videoBufsize || "4000k";
   const tune = process.env.VIDEO_TUNE || plan.videoTune || "stillimage";
+
+  // Thread limit
+  const threads = Number(process.env.FFMPEG_THREADS || 2); // ✅ Railway'de 1-2 ideal
 
   const dur = await ffprobeDurationSec(audioPath);
   const total = Math.max(1, dur || 60);
 
-  // Zoom ayarları (titremeyi azaltmak için daha düşük amplitude + doğru fps zinciri)
-  const zoomPeriodSec = Number(process.env.ZOOM_PERIOD_SEC || plan.zoomPeriodSec || 8);
+  // Zoom daha hafif
+  const zoomPeriodSec = Number(process.env.ZOOM_PERIOD_SEC || plan.zoomPeriodSec || 10);
   const baseZoom = Number(process.env.ZOOM_BASE || plan.zoomBase || 1.01);
-  const amplZoom = Number(process.env.ZOOM_AMPL || plan.zoomAmpl || 0.01);
-
-  // periyot frame cinsinden
+  const amplZoom = Number(process.env.ZOOM_AMPL || plan.zoomAmpl || 0.008);
   const denom = Math.max(60, Math.round(fps * zoomPeriodSec));
 
   const ctaEnabled = Boolean(ctaPath) && (plan.cta !== false);
   const ctaDur = Number(process.env.CTA_DURATION_SEC || plan.ctaDurationSec || 6);
 
-  // ✅ KRİTİK: image inputlarını 30 fps diye “okut” (25/30 karışıklığı → titreme yapıyordu)
-  const args = ["-y", "-loglevel", "error"];
+  const args = ["-y", "-loglevel", "warning"];
+
+  // ✅ thread limit (hem filtre hem encoder tarafı)
+  args.push(
+    "-threads", String(threads),
+    "-filter_threads", "1",
+    "-filter_complex_threads", "1"
+  );
+
+  // ✅ image input fps sabitle (25/30 karışımı titreme + yük yapıyordu)
   args.push("-framerate", String(fps), "-loop", "1", "-t", String(total + 0.25), "-i", bgPath);
 
   if (ctaEnabled) {
@@ -284,9 +295,9 @@ async function imagePlusAudioToMp4Single(bgPath, audioPath, outMp4, plan = {}, c
 
   args.push("-i", audioPath);
 
-  // Background filter: scale/crop + smooth zoompan
-  // Not: fps filtresini KALDIRDIK (input framerate’i zaten fps yaptık)
   const parts = [];
+
+  // bg: scale/crop + zoompan
   parts.push(
     `[0:v]` +
       `scale=${W}:${H}:force_original_aspect_ratio=increase,` +
@@ -306,7 +317,9 @@ async function imagePlusAudioToMp4Single(bgPath, audioPath, outMp4, plan = {}, c
     const enableFrom = Math.max(0, total - ctaDur);
     const enableTo = total;
 
-    parts.push(`[1:v]scale=${W}:-1,format=rgba[cta]`);
+    // ✅ CTA'yı 1920’ye büyütme: overlay maliyetini düşür
+    parts.push(`[1:v]scale=w='min(iw,800)':h=-1,format=rgba[cta]`);
+
     parts.push(
       `${vOut}[cta]overlay=` +
         `x=(W-w)/2:` +
@@ -323,9 +336,7 @@ async function imagePlusAudioToMp4Single(bgPath, audioPath, outMp4, plan = {}, c
   const filter = parts.join(";");
 
   const audioIdx = ctaEnabled ? 2 : 1;
-
-  // GOP (keyframe) stabilitesi
-  const gop = Number(process.env.VIDEO_GOP || plan.videoGop || (fps * 2)); // 2 saniye
+  const gop = Number(process.env.VIDEO_GOP || plan.videoGop || (fps * 2));
 
   args.push(
     "-filter_complex", filter,
@@ -337,11 +348,13 @@ async function imagePlusAudioToMp4Single(bgPath, audioPath, outMp4, plan = {}, c
     "-tune", tune,
     "-crf", String(crf),
 
-    // ✅ Boyut kontrolü (VBV cap)
+    // ✅ boyut cap
     "-maxrate", maxrate,
     "-bufsize", bufsize,
 
-    // ✅ Stabil timeline / keyframe
+    // ✅ encoder thread limit (libx264)
+    "-x264-params", `threads=${threads}:lookahead-threads=1:sliced-threads=0`,
+
     "-g", String(gop),
     "-keyint_min", String(gop),
     "-sc_threshold", "0",
