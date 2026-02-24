@@ -22,30 +22,74 @@ if (!_fetch) {
     _fetch = require("node-fetch");
   } catch (e) {
     throw new Error(
-      "Global fetch yok. Node 18+ kullan veya `node-fetch@2` kurup tekrar dene."
+      "Global fetch yok. Node 18+ kullan veya `node-fetch@2` kur."
     );
   }
 }
 const fetch = _fetch;
 
-// --- Google Cloud TTS ---
+// ======================
+// ✅ GCP TTS ENV MAPPING
+// ======================
 /**
- * Gereken env seçenekleri:
- * 1) GOOGLE_APPLICATION_CREDENTIALS = /path/to/service-account.json
- * veya
- * 2) GOOGLE_SERVICE_ACCOUNT_JSON = (service account JSON içeriği)  <-- Railway için pratik
+ * Railway'deki env isimlerin:
+ * - GCP_TTS_KEY_B64   : base64(service account json)
+ * - GCP_TTS_VOICE     : örn "tr-TR-Wavenet-D"
+ * - GCP_TTS_RATE      : örn "0.92"
+ * - GCP_TTS_PITCH     : örn "0"
  *
- * Opsiyonel:
- *  GOOGLE_TTS_VOICE_NAME = tr-TR-Wavenet-D (ses adı; yanlışsa hata verir, boş bırakmak daha güvenli)
- *  GOOGLE_TTS_SPEAKING_RATE = 0.92 (0.25 - 4.0 arası)
- *  GOOGLE_TTS_PITCH = 0 ( -20.0 - 20.0 )
+ * Not: @google-cloud/text-to-speech ADC kullanır.
+ * Biz burada key'i decode edip tmp dosyaya yazıp GOOGLE_APPLICATION_CREDENTIALS set ediyoruz.
  */
-if (!process.env.GOOGLE_APPLICATION_CREDENTIALS && process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
-  const saPath = path.join(os.tmpdir(), "gcp_sa.json");
-  fs.writeFileSync(saPath, process.env.GOOGLE_SERVICE_ACCOUNT_JSON, "utf8");
-  process.env.GOOGLE_APPLICATION_CREDENTIALS = saPath;
+function ensureGoogleCredsFromRailwayEnv() {
+  // Voice/Rate/Pitch mapping (kütüphanede kendimiz okuyacağız ama isimleri standartlaştırmak iyi)
+  if (!process.env.GOOGLE_TTS_VOICE_NAME && process.env.GCP_TTS_VOICE) {
+    process.env.GOOGLE_TTS_VOICE_NAME = process.env.GCP_TTS_VOICE;
+  }
+  if (!process.env.GOOGLE_TTS_SPEAKING_RATE && process.env.GCP_TTS_RATE) {
+    process.env.GOOGLE_TTS_SPEAKING_RATE = process.env.GCP_TTS_RATE;
+  }
+  if (!process.env.GOOGLE_TTS_PITCH && process.env.GCP_TTS_PITCH) {
+    process.env.GOOGLE_TTS_PITCH = process.env.GCP_TTS_PITCH;
+  }
+
+  // Eğer zaten set ise dokunma
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) return { ok: true, mode: "file_path" };
+
+  // Base64 key varsa decode edip dosyaya yaz
+  const b64 = (process.env.GCP_TTS_KEY_B64 || "").trim();
+  if (b64) {
+    try {
+      const cleaned = b64.replace(/\s+/g, ""); // satır sonları vs.
+      const jsonText = Buffer.from(cleaned, "base64").toString("utf8");
+
+      // JSON mu kontrol (erken hata yakalamak için)
+      JSON.parse(jsonText);
+
+      const saPath = path.join(os.tmpdir(), "gcp_sa.json");
+      fs.writeFileSync(saPath, jsonText, "utf8");
+      process.env.GOOGLE_APPLICATION_CREDENTIALS = saPath;
+      return { ok: true, mode: "b64_to_tmp_file" };
+    } catch (e) {
+      return { ok: false, error: "GCP_TTS_KEY_B64 decode/JSON parse failed: " + (e?.message || String(e)) };
+    }
+  }
+
+  return {
+    ok: false,
+    error:
+      "Google TTS credentials missing. Railway env'de `GCP_TTS_KEY_B64` set etmelisin (base64 service account JSON).",
+  };
 }
 
+// Creds'i app ayağa kalkarken hazırla
+const credStatus = ensureGoogleCredsFromRailwayEnv();
+if (!credStatus.ok) {
+  // Burada throw etmek yerine endpoint'te de kontrol edeceğiz ama boot'ta da görünür olsun
+  console.error("[GCP TTS]", credStatus.error);
+}
+
+// --- Google Cloud TTS ---
 const textToSpeech = require("@google-cloud/text-to-speech");
 const ttsClient = new textToSpeech.TextToSpeechClient();
 
@@ -149,7 +193,6 @@ async function wavToM4a(inWav, outM4a) {
 
 // --- Google TTS (WAV) ---
 function chunkText(text, maxLen = 4500) {
-  // Google TTS limitlerine takılmamak için güvenli bölme
   const s = String(text || "").trim();
   if (!s) return [];
   if (s.length <= maxLen) return [s];
@@ -176,7 +219,6 @@ async function googleTtsToWav(text, wavPath) {
   const parts = chunkText(text, 4500);
   if (parts.length === 0) throw new Error("TTS text empty");
 
-  // Her parçayı wav üretip sonra birleştireceğiz (güvenli yol)
   const tmpDir = path.join(path.dirname(wavPath), "gtts_parts");
   await fsp.mkdir(tmpDir, { recursive: true });
   const partWavs = [];
@@ -188,7 +230,7 @@ async function googleTtsToWav(text, wavPath) {
         ? { languageCode: "tr-TR", name: voiceName }
         : { languageCode: "tr-TR", ssmlGender: "NEUTRAL" },
       audioConfig: {
-        audioEncoding: "LINEAR16", // WAV/PCM
+        audioEncoding: "LINEAR16",
         speakingRate,
         pitch,
       },
@@ -207,7 +249,6 @@ async function googleTtsToWav(text, wavPath) {
     return;
   }
 
-  // concat wav parts (demuxer)
   const listPath = path.join(tmpDir, "list.txt");
   const listBody = partWavs.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join("\n");
   await writeFileSafe(listPath, Buffer.from(listBody, "utf8"));
@@ -248,14 +289,11 @@ async function singleImagePlusAudioToMp4(bgPath, audioPath, outMp4, opts = {}) {
   args.push("-i", audioPath);
 
   // zoom aç/kapat: 6 saniyede bir in-out
-  // zoom ~ [1.00 .. 1.06] aralığı
   const periodSec = 6;
   const periodFrames = fps * periodSec;
 
   const filters = [];
 
-  // bg zoom
-  // Not: zoompan için d=1 yeterli çünkü input fps=30 ve t ile ilerliyor.
   filters.push(
     `[0:v]` +
       `scale=${W}:${H}:force_original_aspect_ratio=increase,` +
@@ -270,14 +308,8 @@ async function singleImagePlusAudioToMp4(bgPath, audioPath, outMp4, opts = {}) {
     `[vbg]`
   );
 
-  // CTA overlay (son ctaDurationSec)
   if (ctaPath) {
-    // CTA’yı genişliğe göre ölçekle, alta koy
-    filters.push(
-      `[1:v]scale=${W}:-1,format=rgba[cta]`
-    );
-
-    // enable: son X saniye
+    filters.push(`[1:v]scale=${W}:-1,format=rgba[cta]`);
     const startAt = Math.max(0, total - ctaDurationSec);
     filters.push(
       `[vbg][cta]overlay=` +
@@ -362,7 +394,6 @@ async function processJob(jobId, jobDir, bgPath, plan, ctaPath) {
     const wavs = [];
     let idx = 0;
 
-    // Helper: add Google TTS clip (and normalize)
     const addTtsClip = async (text, name) => {
       const raw = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}_raw.wav`);
       const norm = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}.wav`);
@@ -371,7 +402,6 @@ async function processJob(jobId, jobDir, bgPath, plan, ctaPath) {
       wavs.push(norm);
     };
 
-    // Helper: add mp3 from url (download + normalize)
     const addMp3UrlClip = async (url, name) => {
       const mp3 = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}.mp3`);
       const wav = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}.wav`);
@@ -380,7 +410,6 @@ async function processJob(jobId, jobDir, bgPath, plan, ctaPath) {
       wavs.push(wav);
     };
 
-    // ✅ Intro + announce + bismillah + segments + outro
     setStage(jobId, "tts_intro");
     if (plan.introText) await addTtsClip(plan.introText, "intro");
 
@@ -408,7 +437,6 @@ async function processJob(jobId, jobDir, bgPath, plan, ctaPath) {
 
     if (wavs.length === 0) throw new Error("Hiç audio clip üretilmedi");
 
-    // concat list file
     setStage(jobId, "concat");
     const listPath = path.join(jobDir, "list.txt");
     const listBody = wavs.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join("\n");
@@ -417,17 +445,14 @@ async function processJob(jobId, jobDir, bgPath, plan, ctaPath) {
     const concatWav = path.join(jobDir, "concat.wav");
     await concatWavs(listPath, concatWav);
 
-    // trailing silence temizle
     setStage(jobId, "trim_silence");
     const finalWav = path.join(jobDir, "final_nosilence.wav");
     await trimTrailingSilence(concatWav, finalWav);
 
-    // encode audio
     setStage(jobId, "encode_audio");
     const audioM4a = path.join(jobDir, "audio.m4a");
     await wavToM4a(finalWav, audioM4a);
 
-    // make mp4 (single bg + zoom in/out)
     setStage(jobId, "render_mp4");
     const outMp4 = path.join(jobDir, "output.mp4");
 
@@ -440,7 +465,6 @@ async function processJob(jobId, jobDir, bgPath, plan, ctaPath) {
       ctaDurationSec,
     });
 
-    // sanity: duration
     setStage(jobId, "verify");
     const dur2 = await ffprobeDurationSec(outMp4);
     if (dur2 < 10) throw new Error(`Video duration too short: ${dur2.toFixed(2)}s`);
@@ -465,21 +489,14 @@ app.get("/health", (_, res) => res.json({ ok: true }));
 // START
 app.post("/render10min/start", upload.any(), async (req, res) => {
   try {
-    // Google creds kontrolü (en azından bir yöntem)
-    if (
-      !process.env.GOOGLE_APPLICATION_CREDENTIALS &&
-      !process.env.GOOGLE_SERVICE_ACCOUNT_JSON
-    ) {
-      return res.status(500).json({
-        error:
-          "Google TTS credentials missing. Set GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_SERVICE_ACCOUNT_JSON",
-      });
+    // Her requestte bir daha kontrol (deploy sonrası env geç gelirse vs.)
+    const st = ensureGoogleCredsFromRailwayEnv();
+    if (!st.ok) {
+      return res.status(500).json({ error: st.error });
     }
 
     const files = Array.isArray(req.files) ? req.files : [];
-    if (!req.body?.plan) {
-      return res.status(400).json({ error: "Missing plan field" });
-    }
+    if (!req.body?.plan) return res.status(400).json({ error: "Missing plan field" });
 
     let plan;
     try {
@@ -488,14 +505,16 @@ app.post("/render10min/start", upload.any(), async (req, res) => {
       return res.status(400).json({ error: "Plan JSON parse error" });
     }
 
-    // ✅ Tek BG bekliyoruz: bg1 (veya eski uyumluluk: image)
+    // ✅ Tek BG: bg1 (opsiyonel eski uyumluluk: image)
     const bgFile =
       files.find((f) => f?.buffer && /^bg1$/i.test(String(f.fieldname))) ||
       files.find((f) => f?.buffer && String(f.fieldname).toLowerCase() === "image");
 
     if (!bgFile) {
       return res.status(400).json({
-        error: "Missing required files. Need bg1. Got: " + (files.map((f) => f.fieldname).join(", ") || "none"),
+        error:
+          "Missing required files. Need bg1. Got: " +
+          (files.map((f) => f.fieldname).join(", ") || "none"),
       });
     }
 
@@ -503,11 +522,9 @@ app.post("/render10min/start", upload.any(), async (req, res) => {
     const jobDir = path.join(os.tmpdir(), `render10min_${jobId}`);
     await fsp.mkdir(jobDir, { recursive: true });
 
-    // Write BG
     const bgPath = path.join(jobDir, "bg_01.png");
     await writeFileSafe(bgPath, bgFile.buffer);
 
-    // Resolve CTA (optional)
     const ctaPath = await resolveCta(jobDir, files);
 
     jobs.set(jobId, {
@@ -519,7 +536,16 @@ app.post("/render10min/start", upload.any(), async (req, res) => {
 
     setImmediate(() => processJob(jobId, jobDir, bgPath, plan, ctaPath));
 
-    res.json({ jobId, bgCount: 1, cta: Boolean(ctaPath) });
+    res.json({
+      jobId,
+      bgCount: 1,
+      cta: Boolean(ctaPath),
+      tts: {
+        voice: process.env.GOOGLE_TTS_VOICE_NAME || null,
+        rate: process.env.GOOGLE_TTS_SPEAKING_RATE || null,
+        pitch: process.env.GOOGLE_TTS_PITCH || null,
+      },
+    });
   } catch (err) {
     res.status(500).json({ error: err?.message || String(err) });
   }
