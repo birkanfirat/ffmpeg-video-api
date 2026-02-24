@@ -362,20 +362,21 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
   const dur = await ffprobeDurationSec(audioPath);
   const total = Math.max(1, dur || 60);
 
-  // ✅ Zoom kontrolü (gözle görünür)
-  const zoomMin = Number(process.env.ZOOM_MIN || plan.zoomMin || 1.0);
-  const zoomMax = Number(process.env.ZOOM_MAX || plan.zoomMax || 1.06);
-  const zoomPeriodSec = Number(process.env.ZOOM_PERIOD_SEC || plan.zoomPeriodSec || 10);
+  // ✅ Net zoom kontrol (gözle görülür)
+  const zoomMin = Number(process.env.ZOOM_MIN || plan.zoomMin || 1.00);
+  const zoomMax = Number(process.env.ZOOM_MAX || plan.zoomMax || 1.08);
+  const zoomPeriodSec = Number(process.env.ZOOM_PERIOD_SEC || plan.zoomPeriodSec || 12);
   const denom = Math.max(60, Math.round(fps * zoomPeriodSec)); // zoompan uses "on"
 
-  // ✅ Overscan: sampling daha stabil + zoom-out payı
+  // ✅ Stabilite için overscan
   const overscan = Number(process.env.ZOOM_OVERSCAN || plan.zoomOverscan || 1.12);
   const bigW = Math.round(W * overscan);
   const bigH = Math.round(H * overscan);
 
-  // ✅ Opsiyonel shimmer killer blur
-  const gblurSigma = Number(process.env.ZOOM_GBLUR_SIGMA || plan.zoomGblurSigma || 0);
+  // ✅ Shimmer/jitter killer (çok hafif, opsiyonel ama öneririm)
+  const gblurSigma = Number(process.env.ZOOM_GBLUR_SIGMA || plan.zoomGblurSigma || 0.3);
 
+  // ✅ CTA
   const ctaEnabled = Boolean(ctaPath) && (plan.cta !== false);
   const ctaStartDur = Number(process.env.CTA_START_DURATION_SEC || plan.ctaStartDurationSec || 4);
   const ctaEndDur = Number(process.env.CTA_DURATION_SEC || plan.ctaDurationSec || 6);
@@ -383,44 +384,48 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
 
   const args = ["-y", "-loglevel", "warning"];
 
-  // ✅ scaler kalitesi
+  // ✅ resample kalitesi
   args.push("-sws_flags", "lanczos+accurate_rnd+full_chroma_int");
   args.push("-threads", String(threads), "-filter_threads", "1", "-filter_complex_threads", "1");
 
   const bgCount = Math.max(1, Math.min(6, bgPaths.length || 1));
   const segDur = total / bgCount;
 
-  // still image inputs
+  // BG inputs
   for (let i = 0; i < bgCount; i++) {
     args.push("-loop", "1", "-t", String(segDur + 0.25), "-i", bgPaths[i]);
   }
 
-  // CTA image as video stream (optional)
+  // CTA input (optional)
   if (ctaEnabled) {
     args.push("-loop", "1", "-t", String(total + 0.25), "-i", ctaPath);
   }
 
-  // audio
+  // audio input
   args.push("-i", audioPath);
 
   const parts = [];
 
   for (let i = 0; i < bgCount; i++) {
-    // ✅ smooth zoom (cos easing): zoomMin..zoomMax
+    // ✅ Smooth ease-in-out zoom (cos)
     const zExpr = `${zoomMin}+(${zoomMax}-${zoomMin})*(0.5-0.5*cos(2*PI*on/${denom}))`;
 
-    // ✅ even pixel lock for x/y (reduces jitter)
+    // ✅ Jitter azalt: x/y'yi even pixel'e kilitle
     const xExpr = `trunc(((iw-iw/zoom)/2)/2)*2`;
     const yExpr = `trunc(((ih-ih/zoom)/2)/2)*2`;
 
-    const blurPart = gblurSigma > 0 ? `gblur=sigma=${gblurSigma}:steps=1,` : "";
+    const blurPart =
+      gblurSigma > 0 ? `gblur=sigma=${gblurSigma}:steps=1,` : "";
 
     parts.push(
       `[${i}:v]` +
+        // 1) overscan boyuta sabitle
         `scale=${bigW}:${bigH}:force_original_aspect_ratio=increase:flags=lanczos,` +
         `crop=${bigW}:${bigH},` +
+        // 2) (opsiyonel) çok hafif blur → shimmer/deprem hissini kırar
         `format=yuv420p,` +
         blurPart +
+        // 3) zoompan (on var, stabil)
         `zoompan=` +
           `z='${zExpr}':` +
           `x='${xExpr}':` +
@@ -430,18 +435,20 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
     );
   }
 
-  // concat BG segments
+  // concat
   const concatIns = Array.from({ length: bgCount }, (_, i) => `[v${i}]`).join("");
   parts.push(`${concatIns}concat=n=${bgCount}:v=1:a=0[vbg]`);
 
   let vOut = "[vbg]";
 
-  // CTA overlay at start + end
+  // CTA overlay (baş + son)
   if (ctaEnabled) {
     const ctaIndex = bgCount;
     const ctaMaxW = Math.min(900, Math.round(W * 0.7));
 
-    parts.push(`[${ctaIndex}:v]scale=w='min(iw,${ctaMaxW})':h=-1:flags=lanczos,format=rgba[cta]`);
+    parts.push(
+      `[${ctaIndex}:v]scale=w='min(iw,${ctaMaxW})':h=-1:flags=lanczos,format=rgba[cta]`
+    );
 
     const startFrom = 0;
     const startTo = Math.min(total, ctaStartDur);
@@ -451,14 +458,15 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
     const enableExpr =
       `between(t,${startFrom.toFixed(3)},${startTo.toFixed(3)})+between(t,${endFrom.toFixed(3)},${endTo.toFixed(3)})`;
 
+    // ✅ kesin altta: main_w/main_h
     parts.push(`${vOut}format=rgba[base]`);
     parts.push(
       `[base][cta]overlay=` +
         `x=(main_w-overlay_w)/2:` +
         `y=main_h-overlay_h-${ctaBottomMargin}:` +
-        `enable='${enableExpr}':format=auto,` +
-        `format=yuv420p[vout]`
+        `enable='${enableExpr}':format=auto,format=yuv420p[vout]`
     );
+
     vOut = "[vout]";
   } else {
     parts.push(`${vOut}format=yuv420p[vout]`);
@@ -467,7 +475,6 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
 
   const filter = parts.join(";");
 
-  // audio index: bg inputs + (cta optional) + audio
   const audioIdx = ctaEnabled ? bgCount + 1 : bgCount;
   const gop = Number(process.env.VIDEO_GOP || plan.videoGop || fps * 2);
 
