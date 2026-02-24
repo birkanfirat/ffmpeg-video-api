@@ -362,13 +362,16 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
   const dur = await ffprobeDurationSec(audioPath);
   const total = Math.max(1, dur || 60);
 
-  // ✅ Zoom param (crop-window yöntemi)
+  // ✅ Zoompan param
   const zoomPeriodSec = Number(process.env.ZOOM_PERIOD_SEC || plan.zoomPeriodSec || 10);
-  // ampl 0.008 çok agresif shimmer yapabiliyor → 0.003-0.005 daha stabil
+  const baseZoom = Number(process.env.ZOOM_BASE || plan.zoomBase || 1.005);
   const amplZoom = Number(process.env.ZOOM_AMPL || plan.zoomAmpl || 0.004);
-  // “base” artık 1.0 kabul (crop-window ile zoom)
-  // overscan: kaynağı büyük yapıp zoom-out için alan bırakıyoruz
+  const denom = Math.max(60, Math.round(fps * zoomPeriodSec)); // on / denom
+
+  // ✅ Overscan (sampling daha stabil)
   const overscan = Number(process.env.ZOOM_OVERSCAN || plan.zoomOverscan || 1.12);
+  const bigW = Math.round(W * overscan);
+  const bigH = Math.round(H * overscan);
 
   const ctaEnabled = Boolean(ctaPath) && (plan.cta !== false);
   const ctaStartDur = Number(process.env.CTA_START_DURATION_SEC || plan.ctaStartDurationSec || 4);
@@ -377,14 +380,15 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
 
   const args = ["-y", "-loglevel", "warning"];
 
-  // ✅ scaler kalitesini iyileştir (shimmer azalır)
+  // scaler kalitesi (shimmer azaltır)
   args.push("-sws_flags", "lanczos+accurate_rnd+full_chroma_int");
+
   args.push("-threads", String(threads), "-filter_threads", "1", "-filter_complex_threads", "1");
 
   const bgCount = Math.max(1, Math.min(6, bgPaths.length || 1));
   const segDur = total / bgCount;
 
-  // ✅ Still image input: framerate zorlamasını azalt (daha stabil)
+  // ✅ still image input
   for (let i = 0; i < bgCount; i++) {
     args.push("-loop", "1", "-t", String(segDur + 0.25), "-i", bgPaths[i]);
   }
@@ -397,28 +401,20 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
 
   const parts = [];
 
-  const bigW = Math.round(W * overscan);
-  const bigH = Math.round(H * overscan);
-
   for (let i = 0; i < bgCount; i++) {
-    // z(t) = 1 + ampl*sin(2*pi*t/period)
-    // crop penceresi: out_w = W / z, out_h = H / z  (even sayıya yuvarla)
-    const zExpr = `1+${amplZoom}*sin(2*PI*t/${zoomPeriodSec})`;
-    const cropW = `trunc((${W})/(${zExpr})/2)*2`;
-    const cropH = `trunc((${H})/(${zExpr})/2)*2`;
-
     parts.push(
       `[${i}:v]` +
-        // önce overscan boyutuna getir (tek sefer)
+        // 1) önce overscan boyuta sabitle
         `scale=${bigW}:${bigH}:force_original_aspect_ratio=increase:flags=lanczos,` +
         `crop=${bigW}:${bigH},` +
-        // dinamik crop ile zoom (merkez sabit)
-        `crop=w='${cropW}':h='${cropH}':` +
-          `x='trunc((in_w-out_w)/2)':y='trunc((in_h-out_h)/2)',` +
-        // final output ölçüsüne tek sefer scale
-        `scale=${W}:${H}:flags=lanczos,` +
-        `fps=${fps},` +
-        `format=yuv420p,setsar=1,setpts=PTS-STARTPTS[v${i}]`
+        `format=yuv420p,` +
+        // 2) zoompan (t yok, on var) + integer x/y → jitter azalır
+        `zoompan=` +
+          `z='max(1.0,${baseZoom}+${amplZoom}*sin(2*PI*on/${denom}))':` +
+          `x='trunc(iw/2-(iw/zoom/2))':` +
+          `y='trunc(ih/2-(ih/zoom/2))':` +
+          `d=1:s=${W}x${H}:fps=${fps},` +
+        `setsar=1,setpts=PTS-STARTPTS[v${i}]`
     );
   }
 
@@ -441,7 +437,7 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
     const enableExpr =
       `between(t,${startFrom.toFixed(3)},${startTo.toFixed(3)})+between(t,${endFrom.toFixed(3)},${endTo.toFixed(3)})`;
 
-    // ✅ CTA kesinlikle altta: main_w/main_h kullan
+    // ✅ CTA kesin altta: main_w/main_h
     parts.push(`${vOut}format=rgba[base]`);
     parts.push(
       `[base][cta]overlay=` +
