@@ -14,16 +14,13 @@ const fsp = require("fs/promises");
 const { spawn } = require("child_process");
 const crypto = require("crypto");
 
-// --- Fetch fallback (Railway Node 18+ genelde var) ---
+// --- Fetch fallback (Node 18+ genelde var) ---
 let _fetch = globalThis.fetch;
 if (!_fetch) {
   try {
-    // npm i node-fetch@2
-    _fetch = require("node-fetch");
+    _fetch = require("node-fetch"); // node-fetch@2
   } catch (e) {
-    throw new Error(
-      "Global fetch yok. Node 18+ kullan veya `node-fetch@2` kur."
-    );
+    throw new Error("Global fetch yok. Node 18+ kullan veya `node-fetch@2` kur.");
   }
 }
 const fetch = _fetch;
@@ -31,18 +28,7 @@ const fetch = _fetch;
 // ======================
 // ✅ GCP TTS ENV MAPPING
 // ======================
-/**
- * Railway'deki env isimlerin:
- * - GCP_TTS_KEY_B64   : base64(service account json)
- * - GCP_TTS_VOICE     : örn "tr-TR-Wavenet-D"
- * - GCP_TTS_RATE      : örn "0.92"
- * - GCP_TTS_PITCH     : örn "0"
- *
- * Not: @google-cloud/text-to-speech ADC kullanır.
- * Biz burada key'i decode edip tmp dosyaya yazıp GOOGLE_APPLICATION_CREDENTIALS set ediyoruz.
- */
 function ensureGoogleCredsFromRailwayEnv() {
-  // Voice/Rate/Pitch mapping (kütüphanede kendimiz okuyacağız ama isimleri standartlaştırmak iyi)
   if (!process.env.GOOGLE_TTS_VOICE_NAME && process.env.GCP_TTS_VOICE) {
     process.env.GOOGLE_TTS_VOICE_NAME = process.env.GCP_TTS_VOICE;
   }
@@ -53,17 +39,13 @@ function ensureGoogleCredsFromRailwayEnv() {
     process.env.GOOGLE_TTS_PITCH = process.env.GCP_TTS_PITCH;
   }
 
-  // Eğer zaten set ise dokunma
   if (process.env.GOOGLE_APPLICATION_CREDENTIALS) return { ok: true, mode: "file_path" };
 
-  // Base64 key varsa decode edip dosyaya yaz
   const b64 = (process.env.GCP_TTS_KEY_B64 || "").trim();
   if (b64) {
     try {
-      const cleaned = b64.replace(/\s+/g, ""); // satır sonları vs.
+      const cleaned = b64.replace(/\s+/g, "");
       const jsonText = Buffer.from(cleaned, "base64").toString("utf8");
-
-      // JSON mu kontrol (erken hata yakalamak için)
       JSON.parse(jsonText);
 
       const saPath = path.join(os.tmpdir(), "gcp_sa.json");
@@ -77,17 +59,12 @@ function ensureGoogleCredsFromRailwayEnv() {
 
   return {
     ok: false,
-    error:
-      "Google TTS credentials missing. Railway env'de `GCP_TTS_KEY_B64` set etmelisin (base64 service account JSON).",
+    error: "Google TTS credentials missing. Railway env'de `GCP_TTS_KEY_B64` set et (base64 service account JSON).",
   };
 }
 
-// Creds'i app ayağa kalkarken hazırla
 const credStatus = ensureGoogleCredsFromRailwayEnv();
-if (!credStatus.ok) {
-  // Burada throw etmek yerine endpoint'te de kontrol edeceğiz ama boot'ta da görünür olsun
-  console.error("[GCP TTS]", credStatus.error);
-}
+if (!credStatus.ok) console.error("[GCP TTS]", credStatus.error);
 
 // --- Google Cloud TTS ---
 const textToSpeech = require("@google-cloud/text-to-speech");
@@ -99,29 +76,45 @@ const PORT = process.env.PORT || 3000;
 // Multer: keep files in memory then write to job folder
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB per file
+  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB
 });
 
-// In-memory job store (Railway restart -> reset). For production, persist to Redis/S3.
+// In-memory job store (restart -> reset)
 const jobs = new Map();
 
 function uid() {
-  return crypto.randomUUID
-    ? crypto.randomUUID()
-    : crypto.randomBytes(16).toString("hex");
+  return crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
 }
 
+/**
+ * ✅ KRİTİK FIX:
+ * - stdout/stderr sınırsız birikmesin (OOM -> ffmpeg SIGKILL oluyordu)
+ * - sadece son 64KB tutulur
+ */
 function runCmd(bin, args, opts = {}) {
+  const MAX = 64 * 1024;
+
+  function tailAppend(prev, chunk) {
+    const next = prev + chunk;
+    return next.length > MAX ? next.slice(next.length - MAX) : next;
+  }
+
   return new Promise((resolve, reject) => {
     const p = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"], ...opts });
+
     let out = "";
     let err = "";
-    p.stdout.on("data", (d) => (out += d.toString()));
-    p.stderr.on("data", (d) => (err += d.toString()));
+
+    p.stdout.on("data", (d) => (out = tailAppend(out, d.toString())));
+    p.stderr.on("data", (d) => (err = tailAppend(err, d.toString())));
+
     p.on("error", reject);
-    p.on("close", (code) => {
-      if (code === 0) resolve({ out, err });
-      else reject(new Error(`${bin} ${args.join(" ")} failed (code=${code}):\n${err}`));
+
+    p.on("close", (code, signal) => {
+      if (code === 0) return resolve({ out, err });
+
+      const sig = signal ? ` signal=${signal}` : "";
+      reject(new Error(`${bin} ${args.join(" ")} failed (code=${code}${sig}):\n${err}`));
     });
   });
 }
@@ -150,9 +143,9 @@ async function downloadToFile(url, filePath) {
   await writeFileSafe(filePath, Buffer.from(ab));
 }
 
-// Normalize any audio to 48kHz mono WAV PCM (concat sorunlarını bitirir)
 async function normalizeToWav(inPath, outWav) {
   await runCmd("ffmpeg", [
+    "-hide_banner", "-loglevel", "error",
     "-y",
     "-i", inPath,
     "-ar", "48000",
@@ -164,6 +157,7 @@ async function normalizeToWav(inPath, outWav) {
 
 async function concatWavs(listFilePath, outWav) {
   await runCmd("ffmpeg", [
+    "-hide_banner", "-loglevel", "error",
     "-y",
     "-f", "concat",
     "-safe", "0",
@@ -173,9 +167,9 @@ async function concatWavs(listFilePath, outWav) {
   ]);
 }
 
-// ✅ Sondaki sessizliği kes (video sonunda boşluk kalmasın)
 async function trimTrailingSilence(inWav, outWav) {
   await runCmd("ffmpeg", [
+    "-hide_banner", "-loglevel", "error",
     "-y",
     "-i", inWav,
     "-af",
@@ -188,7 +182,14 @@ async function trimTrailingSilence(inWav, outWav) {
 }
 
 async function wavToM4a(inWav, outM4a) {
-  await runCmd("ffmpeg", ["-y", "-i", inWav, "-c:a", "aac", "-b:a", "192k", outM4a]);
+  await runCmd("ffmpeg", [
+    "-hide_banner", "-loglevel", "error",
+    "-y",
+    "-i", inWav,
+    "-c:a", "aac",
+    "-b:a", "192k",
+    outM4a,
+  ]);
 }
 
 // --- Google TTS (WAV) ---
@@ -200,11 +201,12 @@ function chunkText(text, maxLen = 4500) {
   const chunks = [];
   let cur = "";
   for (const part of s.split(/\n+/g)) {
-    if ((cur + "\n" + part).trim().length > maxLen) {
+    const candidate = (cur ? cur + "\n" : "") + part;
+    if (candidate.trim().length > maxLen) {
       if (cur.trim()) chunks.push(cur.trim());
       cur = part;
     } else {
-      cur = (cur ? cur + "\n" : "") + part;
+      cur = candidate;
     }
   }
   if (cur.trim()) chunks.push(cur.trim());
@@ -261,56 +263,61 @@ async function googleTtsToWav(text, wavPath) {
 /**
  * ✅ Tek görsel + ses süresi kadar video
  * - hafif zoom aç/kapat (sinus)
- * - opsiyonel CTA overlay (son X saniye)
+ * - CTA (son X saniye) optional
+ *
+ * OOM/kill fix: ffmpeg loglar kapalı + node stderr buffer tail
  */
 async function singleImagePlusAudioToMp4(bgPath, audioPath, outMp4, opts = {}) {
   const W = 1920;
   const H = 1080;
-  const fps = 30;
 
+  const fps = Number(process.env.VIDEO_FPS || 30);
   const dur = await ffprobeDurationSec(audioPath);
   const total = Math.max(1, dur || 60);
 
   const ctaPath = opts.ctaPath || null;
   const ctaDurationSec = Number(opts.ctaDurationSec || 6);
 
-  const args = ["-y"];
+  const periodSec = Number(process.env.ZOOM_PERIOD_SEC || 6);
+  const periodFrames = Math.max(1, Math.round(fps * periodSec));
 
-  // bg input (audio'dan uzun tutuyoruz, -shortest ile kesilecek)
-  args.push("-loop", "1", "-t", String(total + 1), "-i", bgPath);
+  const args = ["-hide_banner", "-loglevel", "error", "-y"];
 
-  // optional cta input
+  // input options: framerate inputa ver (dup/drop kesilir)
+  args.push("-loop", "1", "-framerate", String(fps), "-t", String(total + 1), "-i", bgPath);
+
   if (ctaPath) {
-    args.push("-loop", "1", "-t", String(total + 1), "-i", ctaPath);
+    args.push("-loop", "1", "-framerate", String(fps), "-t", String(total + 1), "-i", ctaPath);
   }
 
   // audio
-  const audioInputIndex = ctaPath ? 2 : 1;
+  const audioIdx = ctaPath ? 2 : 1;
   args.push("-i", audioPath);
-
-  // zoom aç/kapat: 6 saniyede bir in-out
-  const periodSec = 6;
-  const periodFrames = fps * periodSec;
 
   const filters = [];
 
+  // zoom in/out: 1.03 +- 0.03
   filters.push(
     `[0:v]` +
       `scale=${W}:${H}:force_original_aspect_ratio=increase,` +
       `crop=${W}:${H},` +
-      `fps=${fps},` +
       `zoompan=` +
         `z='max(1.0,1.03+0.03*sin(2*PI*on/${periodFrames}))':` +
         `x='iw/2-(iw/zoom/2)':` +
         `y='ih/2-(ih/zoom/2)':` +
-        `d=1:s=${W}x${H},` +
+        `d=1:` +
+        `s=${W}x${H}:` +
+        `fps=${fps},` +
       `setsar=1,format=yuv420p` +
     `[vbg]`
   );
 
   if (ctaPath) {
-    filters.push(`[1:v]scale=${W}:-1,format=rgba[cta]`);
+    // CTA'yı genişliğe göre küçült (çok büyükse)
+    filters.push(`[1:v]scale='min(${W},iw)':-1,format=rgba[cta]`);
+
     const startAt = Math.max(0, total - ctaDurationSec);
+
     filters.push(
       `[vbg][cta]overlay=` +
         `x=(W-w)/2:` +
@@ -322,15 +329,13 @@ async function singleImagePlusAudioToMp4(bgPath, audioPath, outMp4, opts = {}) {
     filters.push(`[vbg]copy[vout]`);
   }
 
-  const filterComplex = filters.join(";");
-
   args.push(
-    "-filter_complex", filterComplex,
+    "-filter_complex", filters.join(";"),
     "-map", "[vout]",
-    "-map", `${audioInputIndex}:a`,
+    "-map", `${audioIdx}:a`,
     "-c:v", "libx264",
-    "-preset", "veryfast",
-    "-crf", "22",
+    "-preset", "ultrafast",     // ✅ Railway için hız
+    "-crf", "26",               // ultrafast ile denge
     "-pix_fmt", "yuv420p",
     "-r", String(fps),
     "-c:a", "aac",
@@ -345,14 +350,13 @@ async function singleImagePlusAudioToMp4(bgPath, audioPath, outMp4, opts = {}) {
 
 function setStage(jobId, stage) {
   const j = jobs.get(jobId);
-  if (!j) return;
-  j.stage = stage;
+  if (j) j.stage = stage;
 }
 
 // Resolve CTA image:
-// 1) multipart field "cta" (preferred)
-// 2) local file assets/cta.png
-// 3) env CTA_IMAGE_URL (download)
+// 1) multipart field "cta"
+// 2) local assets/cta.png
+// 3) env CTA_IMAGE_URL
 async function resolveCta(jobDir, files) {
   const ctaFile = (files || []).find(
     (f) => String(f.fieldname).toLowerCase() === "cta" && f.buffer
@@ -489,11 +493,8 @@ app.get("/health", (_, res) => res.json({ ok: true }));
 // START
 app.post("/render10min/start", upload.any(), async (req, res) => {
   try {
-    // Her requestte bir daha kontrol (deploy sonrası env geç gelirse vs.)
     const st = ensureGoogleCredsFromRailwayEnv();
-    if (!st.ok) {
-      return res.status(500).json({ error: st.error });
-    }
+    if (!st.ok) return res.status(500).json({ error: st.error });
 
     const files = Array.isArray(req.files) ? req.files : [];
     if (!req.body?.plan) return res.status(400).json({ error: "Missing plan field" });
@@ -505,7 +506,6 @@ app.post("/render10min/start", upload.any(), async (req, res) => {
       return res.status(400).json({ error: "Plan JSON parse error" });
     }
 
-    // ✅ Tek BG: bg1 (opsiyonel eski uyumluluk: image)
     const bgFile =
       files.find((f) => f?.buffer && /^bg1$/i.test(String(f.fieldname))) ||
       files.find((f) => f?.buffer && String(f.fieldname).toLowerCase() === "image");
@@ -567,6 +567,7 @@ app.get("/render10min/status/:jobId", (req, res) => {
 app.get("/render10min/result/:jobId", async (req, res) => {
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: "job_not_found" });
+
   if (job.status !== "done" || !job.outputPath) {
     return res.status(409).json({ error: "job_not_done", status: job.status, stage: job.stage });
   }
@@ -579,6 +580,4 @@ app.get("/render10min/result/:jobId", async (req, res) => {
   stream.pipe(res);
 });
 
-app.listen(PORT, () => {
-  console.log(`Render10min server running on :${PORT}`);
-});
+app.listen(PORT, () => console.log(`Render10min server running on :${PORT}`));
