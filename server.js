@@ -362,11 +362,13 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
   const dur = await ffprobeDurationSec(audioPath);
   const total = Math.max(1, dur || 60);
 
-  // Zoom parameters
-  const zoomPeriodSec = Number(process.env.ZOOM_PERIOD_SEC || plan.zoomPeriodSec || 8);
-  const baseZoom = Number(process.env.ZOOM_BASE || plan.zoomBase || 1.01);
-  const amplZoom = Number(process.env.ZOOM_AMPL || plan.zoomAmpl || 0.008);
-  const denom = Math.max(60, Math.round(fps * zoomPeriodSec)); // on/denom
+  // ✅ Zoom param (crop-window yöntemi)
+  const zoomPeriodSec = Number(process.env.ZOOM_PERIOD_SEC || plan.zoomPeriodSec || 10);
+  // ampl 0.008 çok agresif shimmer yapabiliyor → 0.003-0.005 daha stabil
+  const amplZoom = Number(process.env.ZOOM_AMPL || plan.zoomAmpl || 0.004);
+  // “base” artık 1.0 kabul (crop-window ile zoom)
+  // overscan: kaynağı büyük yapıp zoom-out için alan bırakıyoruz
+  const overscan = Number(process.env.ZOOM_OVERSCAN || plan.zoomOverscan || 1.12);
 
   const ctaEnabled = Boolean(ctaPath) && (plan.cta !== false);
   const ctaStartDur = Number(process.env.CTA_START_DURATION_SEC || plan.ctaStartDurationSec || 4);
@@ -375,36 +377,48 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
 
   const args = ["-y", "-loglevel", "warning"];
 
+  // ✅ scaler kalitesini iyileştir (shimmer azalır)
+  args.push("-sws_flags", "lanczos+accurate_rnd+full_chroma_int");
   args.push("-threads", String(threads), "-filter_threads", "1", "-filter_complex_threads", "1");
 
   const bgCount = Math.max(1, Math.min(6, bgPaths.length || 1));
   const segDur = total / bgCount;
 
+  // ✅ Still image input: framerate zorlamasını azalt (daha stabil)
   for (let i = 0; i < bgCount; i++) {
-    args.push("-framerate", String(fps), "-loop", "1", "-t", String(segDur + 0.25), "-i", bgPaths[i]);
+    args.push("-loop", "1", "-t", String(segDur + 0.25), "-i", bgPaths[i]);
   }
 
   if (ctaEnabled) {
-    args.push("-framerate", String(fps), "-loop", "1", "-t", String(total + 0.25), "-i", ctaPath);
+    args.push("-loop", "1", "-t", String(total + 0.25), "-i", ctaPath);
   }
 
   args.push("-i", audioPath);
 
   const parts = [];
 
+  const bigW = Math.round(W * overscan);
+  const bigH = Math.round(H * overscan);
+
   for (let i = 0; i < bgCount; i++) {
+    // z(t) = 1 + ampl*sin(2*pi*t/period)
+    // crop penceresi: out_w = W / z, out_h = H / z  (even sayıya yuvarla)
+    const zExpr = `1+${amplZoom}*sin(2*PI*t/${zoomPeriodSec})`;
+    const cropW = `trunc((${W})/(${zExpr})/2)*2`;
+    const cropH = `trunc((${H})/(${zExpr})/2)*2`;
+
     parts.push(
       `[${i}:v]` +
-        `scale=${W}:${H}:force_original_aspect_ratio=increase,` +
-        `crop=${W}:${H},` +
-        `format=yuv420p,` +
-        `zoompan=` +
-          `z='max(1.0,${baseZoom}+${amplZoom}*sin(2*PI*on/${denom}))':` +
-          // ✅ jitter fix: integer positions
-          `x='trunc((iw-iw/zoom)/2)':` +
-          `y='trunc((ih-ih/zoom)/2)':` +
-          `d=1:s=${W}x${H}:fps=${fps},` +
-        `setsar=1,setpts=PTS-STARTPTS[v${i}]`
+        // önce overscan boyutuna getir (tek sefer)
+        `scale=${bigW}:${bigH}:force_original_aspect_ratio=increase:flags=lanczos,` +
+        `crop=${bigW}:${bigH},` +
+        // dinamik crop ile zoom (merkez sabit)
+        `crop=w='${cropW}':h='${cropH}':` +
+          `x='trunc((in_w-out_w)/2)':y='trunc((in_h-out_h)/2)',` +
+        // final output ölçüsüne tek sefer scale
+        `scale=${W}:${H}:flags=lanczos,` +
+        `fps=${fps},` +
+        `format=yuv420p,setsar=1,setpts=PTS-STARTPTS[v${i}]`
     );
   }
 
@@ -417,7 +431,7 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
     const ctaIndex = bgCount;
     const ctaMaxW = Math.min(900, Math.round(W * 0.7));
 
-    parts.push(`[${ctaIndex}:v]scale=w='min(iw,${ctaMaxW})':h=-1,format=rgba[cta]`);
+    parts.push(`[${ctaIndex}:v]scale=w='min(iw,${ctaMaxW})':h=-1:flags=lanczos,format=rgba[cta]`);
 
     const startFrom = 0;
     const startTo = Math.min(total, ctaStartDur);
@@ -427,7 +441,7 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
     const enableExpr =
       `between(t,${startFrom.toFixed(3)},${startTo.toFixed(3)})+between(t,${endFrom.toFixed(3)},${endTo.toFixed(3)})`;
 
-    // ✅ alpha safe + bottom placement
+    // ✅ CTA kesinlikle altta: main_w/main_h kullan
     parts.push(`${vOut}format=rgba[base]`);
     parts.push(
       `[base][cta]overlay=` +
