@@ -30,9 +30,7 @@ const upload = multer({
 const jobs = new Map();
 
 function uid() {
-  return crypto.randomUUID
-    ? crypto.randomUUID()
-    : crypto.randomBytes(16).toString("hex");
+  return crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
 }
 
 function runCmd(bin, args, opts = {}) {
@@ -52,9 +50,12 @@ function runCmd(bin, args, opts = {}) {
 
 async function ffprobeDurationSec(filePath) {
   const args = [
-    "-v", "error",
-    "-show_entries", "format=duration",
-    "-of", "default=noprint_wrappers=1:nokey=1",
+    "-v",
+    "error",
+    "-show_entries",
+    "format=duration",
+    "-of",
+    "default=noprint_wrappers=1:nokey=1",
     filePath,
   ];
   const { out } = await runCmd("ffprobe", args);
@@ -109,8 +110,6 @@ async function ttsToWav(text, wavPath) {
   const speakingRate = Number(process.env.GCP_TTS_SPEAKING_RATE || "0.92");
   const pitch = Number(process.env.GCP_TTS_PITCH || "0");
 
-  // Google TTS’nin stabil çalışması için: çok uzun metinleri parça parça okumak iyi olur.
-  // Senin textlerin (meal) genelde makul ama yine de garanti olsun:
   const safeText = String(text || "").trim();
   if (!safeText) throw new Error("ttsToWav: empty text");
 
@@ -124,7 +123,6 @@ async function ttsToWav(text, wavPath) {
       audioEncoding: "LINEAR16", // ✅ WAV PCM
       speakingRate: Number.isFinite(speakingRate) ? speakingRate : 0.92,
       pitch: Number.isFinite(pitch) ? pitch : 0,
-      // effectsProfileId: ["telephony-class-application"], // istemezsen kapalı kalsın
     },
   };
 
@@ -133,7 +131,6 @@ async function ttsToWav(text, wavPath) {
     throw new Error("Google TTS returned empty audioContent");
   }
 
-  // audioContent is Buffer (or Uint8Array)
   const buf = Buffer.isBuffer(response.audioContent)
     ? response.audioContent
     : Buffer.from(response.audioContent);
@@ -143,37 +140,27 @@ async function ttsToWav(text, wavPath) {
 
 // Normalize any audio to 48kHz mono WAV PCM (concat sorunlarını bitirir)
 async function normalizeToWav(inPath, outWav) {
-  await runCmd("ffmpeg", [
-    "-y",
-    "-i", inPath,
-    "-ar", "48000",
-    "-ac", "1",
-    "-c:a", "pcm_s16le",
-    outWav,
-  ]);
+  await runCmd("ffmpeg", ["-y", "-i", inPath, "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", outWav]);
 }
 
 async function concatWavs(listFilePath, outWav) {
-  await runCmd("ffmpeg", [
-    "-y",
-    "-f", "concat",
-    "-safe", "0",
-    "-i", listFilePath,
-    "-c:a", "pcm_s16le",
-    outWav,
-  ]);
+  await runCmd("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", listFilePath, "-c:a", "pcm_s16le", outWav]);
 }
 
 // ✅ Sondaki sessizliği kes (video sonunda boşluk kalmasın)
 async function trimTrailingSilence(inWav, outWav) {
   await runCmd("ffmpeg", [
     "-y",
-    "-i", inWav,
+    "-i",
+    inWav,
     "-af",
     "silenceremove=stop_periods=-1:stop_duration=0.6:stop_threshold=-45dB,asetpts=N/SR/TB",
-    "-ar", "48000",
-    "-ac", "1",
-    "-c:a", "pcm_s16le",
+    "-ar",
+    "48000",
+    "-ac",
+    "1",
+    "-c:a",
+    "pcm_s16le",
     outWav,
   ]);
 }
@@ -183,7 +170,7 @@ async function wavToM4a(inWav, outM4a) {
 }
 
 /**
- * ✅ Ken Burns + Sparks + Optional CTA overlay (end)
+ * ✅ Ken Burns + Sparks (stabil)
  * - imagePaths: [bg_01.png, bg_02.png, ...]
  * - audioPath: audio.m4a
  */
@@ -200,20 +187,23 @@ async function imagesPlusAudioToMp4(imagePaths, audioPath, outMp4) {
   const dur = await ffprobeDurationSec(audioPath);
   const total = Math.max(1, dur || 60);
 
+  // ✅ FFmpeg float hassasiyet fixleri
   const n = imagePaths.length;
-  const per = total / n;
+  const totalSafe = Math.floor(total * 100) / 100;              // 2 decimal
+  const per = Math.floor((totalSafe / n) * 100) / 100;          // 2 decimal
+  const framePer = Math.max(1, Math.round(per * fps));          // integer frames
 
   const args = ["-y"];
 
   // Her görseli ayrı input yapıyoruz
   for (let i = 0; i < n; i++) {
-    args.push("-loop", "1", "-t", String(per + 0.2), "-i", imagePaths[i]);
+    // küçük pay bırak: rounding yüzünden video < audio olmasın
+    const t = Math.max(1, per + 0.2);
+    args.push("-loop", "1", "-t", String(t), "-i", imagePaths[i]);
   }
 
   // audio input en sonda
   args.push("-i", audioPath);
-
-  const framePer = Math.ceil(per * fps);
 
   const parts = [];
 
@@ -238,16 +228,16 @@ async function imagesPlusAudioToMp4(imagePaths, audioPath, outMp4) {
   const concatInputs = Array.from({ length: n }, (_, i) => `[v${i}]`).join("");
   parts.push(`${concatInputs}concat=n=${n}:v=1:a=0[bg]`);
 
-  // sparks
+  // sparks (totalSafe)
   parts.push(
-    `nullsrc=s=${W}x${H}:d=${total},` +
+    `nullsrc=s=${W}x${H}:d=${totalSafe},` +
     `noise=alls=40:allf=t+u,` +
     `format=gray,` +
     `lut=y='if(gt(val,253),255,0)',` +
     `boxblur=2:1[mask]`
   );
 
-  parts.push(`color=c=white:s=${W}x${H}:d=${total}[white]`);
+  parts.push(`color=c=white:s=${W}x${H}:d=${totalSafe}[white]`);
   parts.push(`[white][mask]alphamerge,format=rgba,colorchannelmixer=aa=0.28[sparks]`);
 
   parts.push(`[bg][sparks]overlay=shortest=1:format=auto,format=yuv420p[vout]`);
@@ -309,14 +299,13 @@ async function resolveCta(jobDir, files) {
   return null;
 }
 
-async function processJob(jobId, jobDir, bgPaths, plan, ctaPath) {
+async function processJob(jobId, jobDir, bgPaths, plan) {
   try {
     setStage(jobId, "prepare");
 
     if (!plan || !Array.isArray(plan.segments) || plan.segments.length === 0) {
       throw new Error("Plan.segments boş veya yok");
     }
-
     if (!Array.isArray(bgPaths) || bgPaths.length === 0) {
       throw new Error("BG paths boş");
     }
@@ -396,7 +385,7 @@ async function processJob(jobId, jobDir, bgPaths, plan, ctaPath) {
     // make mp4
     setStage(jobId, "render_mp4");
     const outMp4 = path.join(jobDir, "output.mp4");
-    await imagesPlusAudioToMp4(bgPaths, audioM4a, outMp4, plan, ctaPath);
+    await imagesPlusAudioToMp4(bgPaths, audioM4a, outMp4);
 
     // sanity: duration
     setStage(jobId, "verify");
@@ -475,9 +464,6 @@ app.post("/render10min/start", upload.any(), async (req, res) => {
       bgPaths.push(p);
     }
 
-    // Resolve CTA
-    const ctaPath = await resolveCta(jobDir, files);
-
     jobs.set(jobId, {
       status: "processing",
       stage: "queued",
@@ -485,9 +471,9 @@ app.post("/render10min/start", upload.any(), async (req, res) => {
       createdAt: Date.now(),
     });
 
-    setImmediate(() => processJob(jobId, jobDir, bgPaths, plan, ctaPath));
+    setImmediate(() => processJob(jobId, jobDir, bgPaths, plan));
 
-    res.json({ jobId, bgCount: bgPaths.length, cta: Boolean(ctaPath) });
+    res.json({ jobId, bgCount: bgPaths.length });
   } catch (err) {
     res.status(500).json({ error: err?.message || String(err) });
   }
