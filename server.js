@@ -248,88 +248,110 @@ async function ttsTrToWav(text, wavPath) {
 
 // ---- single image + subtle zoom in/out + optional CTA at end ----
 async function imagePlusAudioToMp4Single(bgPath, audioPath, outMp4, plan = {}, ctaPath = null) {
-  const W = 1920;
-  const H = 1080;
-  const fps = Number(process.env.VIDEO_FPS || 30);
+  // Output settings (env ile kontrol edilebilir)
+  const W = Number(process.env.VIDEO_W || plan.videoW || 1920);
+  const H = Number(process.env.VIDEO_H || plan.videoH || 1080);
+  const fps = Number(process.env.VIDEO_FPS || plan.videoFps || 30);
+
+  // Boyut kontrolü (asıl kritik kısım)
+  const preset = process.env.VIDEO_PRESET || plan.videoPreset || "veryfast"; // ❌ ultrafast kullanma
+  const crf = Number(process.env.VIDEO_CRF || plan.videoCrf || 28);          // 26-30 arası iyi
+  const maxrate = process.env.VIDEO_MAXRATE || plan.videoMaxrate || "2500k"; // 10 dk ~ 180-220MB
+  const bufsize = process.env.VIDEO_BUFSIZE || plan.videoBufsize || "5000k";
+  const tune = process.env.VIDEO_TUNE || plan.videoTune || "stillimage";
 
   const dur = await ffprobeDurationSec(audioPath);
   const total = Math.max(1, dur || 60);
 
-  // zoom oscillation period (seconds)
-  const zoomPeriodSec = Number(process.env.ZOOM_PERIOD_SEC || plan.zoomPeriodSec || 6);
-  const denom = Math.max(30, Math.round(fps * zoomPeriodSec)); // frames per cycle
+  // Zoom ayarları (titremeyi azaltmak için daha düşük amplitude + doğru fps zinciri)
+  const zoomPeriodSec = Number(process.env.ZOOM_PERIOD_SEC || plan.zoomPeriodSec || 8);
+  const baseZoom = Number(process.env.ZOOM_BASE || plan.zoomBase || 1.01);
+  const amplZoom = Number(process.env.ZOOM_AMPL || plan.zoomAmpl || 0.01);
+
+  // periyot frame cinsinden
+  const denom = Math.max(60, Math.round(fps * zoomPeriodSec));
 
   const ctaEnabled = Boolean(ctaPath) && (plan.cta !== false);
   const ctaDur = Number(process.env.CTA_DURATION_SEC || plan.ctaDurationSec || 6);
 
+  // ✅ KRİTİK: image inputlarını 30 fps diye “okut” (25/30 karışıklığı → titreme yapıyordu)
   const args = ["-y", "-loglevel", "error"];
+  args.push("-framerate", String(fps), "-loop", "1", "-t", String(total + 0.25), "-i", bgPath);
 
-  // IMPORTANT: -t a little longer + shortest => video ends exactly with audio
-  args.push("-loop", "1", "-t", String(total + 0.25), "-i", bgPath);
-
-  if (ctaEnabled) args.push("-loop", "1", "-t", String(total + 0.25), "-i", ctaPath);
+  if (ctaEnabled) {
+    args.push("-framerate", String(fps), "-loop", "1", "-t", String(total + 0.25), "-i", ctaPath);
+  }
 
   args.push("-i", audioPath);
 
+  // Background filter: scale/crop + smooth zoompan
+  // Not: fps filtresini KALDIRDIK (input framerate’i zaten fps yaptık)
   const parts = [];
-
-  // Background: scale/crop + zoompan
-  // Not: in_range/out_range ile jpeg kaynaklarda range uyarısını da bastırır
   parts.push(
     `[0:v]` +
-      `scale=${W}:${H}:force_original_aspect_ratio=increase:in_range=jpeg:out_range=tv,` +
+      `scale=${W}:${H}:force_original_aspect_ratio=increase,` +
       `crop=${W}:${H},` +
-      `fps=${fps},` +
       `format=yuv420p,` +
       `zoompan=` +
-        `z='max(1.0,1.02+0.02*sin(2*PI*on/${denom}))':` +
-        `x='iw/2-(iw/zoom/2)':` +
-        `y='ih/2-(ih/zoom/2)':` +
+        `z='max(1.0,${baseZoom}+${amplZoom}*sin(2*PI*on/${denom}))':` +
+        `x='(iw-iw/zoom)/2':` +
+        `y='(ih-ih/zoom)/2':` +
         `d=1:s=${W}x${H},` +
       `setsar=1[vbg]`
   );
 
-  let vOutLabel = "[vbg]";
+  let vOut = "[vbg]";
 
   if (ctaEnabled) {
-    // CTA input index:
-    // if enabled => cta is [1:v], audio is [2:a]
     const enableFrom = Math.max(0, total - ctaDur);
     const enableTo = total;
 
+    parts.push(`[1:v]scale=${W}:-1,format=rgba[cta]`);
     parts.push(
-      `[1:v]scale=${W}:-1,format=rgba[cta]`
-    );
-
-    parts.push(
-      `${vOutLabel}[cta]overlay=` +
+      `${vOut}[cta]overlay=` +
         `x=(W-w)/2:` +
         `y=H-h-40:` +
         `enable='between(t,${enableFrom.toFixed(3)},${enableTo.toFixed(3)})':` +
         `format=auto[vout]`
     );
-
-    vOutLabel = "[vout]";
+    vOut = "[vout]";
   } else {
-    parts.push(`${vOutLabel}format=yuv420p[vout]`);
-    vOutLabel = "[vout]";
+    parts.push(`${vOut}format=yuv420p[vout]`);
+    vOut = "[vout]";
   }
 
   const filter = parts.join(";");
 
   const audioIdx = ctaEnabled ? 2 : 1;
 
+  // GOP (keyframe) stabilitesi
+  const gop = Number(process.env.VIDEO_GOP || plan.videoGop || (fps * 2)); // 2 saniye
+
   args.push(
     "-filter_complex", filter,
-    "-map", vOutLabel,
+    "-map", vOut,
     "-map", `${audioIdx}:a`,
+
     "-c:v", "libx264",
-    "-preset", "ultrafast",
-    "-crf", "23",
+    "-preset", preset,
+    "-tune", tune,
+    "-crf", String(crf),
+
+    // ✅ Boyut kontrolü (VBV cap)
+    "-maxrate", maxrate,
+    "-bufsize", bufsize,
+
+    // ✅ Stabil timeline / keyframe
+    "-g", String(gop),
+    "-keyint_min", String(gop),
+    "-sc_threshold", "0",
+
     "-pix_fmt", "yuv420p",
     "-r", String(fps),
+
     "-c:a", "aac",
-    "-b:a", "160k",
+    "-b:a", "128k",
+
     "-movflags", "+faststart",
     "-shortest",
     outMp4
