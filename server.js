@@ -355,89 +355,54 @@ function pickBgFiles(files) {
 // - consistent fps (no "deprem" titreme)
 // - gentler zoom using time "t"
 // - CTA at BEGINNING + END
+
 async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPath = null) {
-  // Defaults (keep small for Railway stability)
   const W = Number(process.env.VIDEO_W || plan.videoW || 1280);
   const H = Number(process.env.VIDEO_H || plan.videoH || 720);
-  const fps = Number(process.env.VIDEO_FPS || plan.videoFps || 25);
+  const fps = Number(process.env.VIDEO_FPS || plan.videoFps || 30);
 
-  // CPU lower
-  const preset = process.env.VIDEO_PRESET || plan.videoPreset || "ultrafast";
+  const preset = process.env.VIDEO_PRESET || plan.videoPreset || "veryfast";
   const tune = process.env.VIDEO_TUNE || plan.videoTune || "stillimage";
 
-  // HARD bitrate cap (prevents 2.38GB surprises)
   const vb = process.env.VIDEO_BITRATE || plan.videoBitrate || "1800k";
-  const maxrate = process.env.VIDEO_MAXRATE || plan.videoMaxrate || vb;
+  const maxrate = process.env.VIDEO_MAXRATE || plan.videoMaxrate || "2500k";
   const minrate = process.env.VIDEO_MINRATE || plan.videoMinrate || vb;
-  const bufsize = process.env.VIDEO_BUFSIZE || plan.videoBufsize || "3600k";
+  const bufsize = process.env.VIDEO_BUFSIZE || plan.videoBufsize || "5000k";
 
-  // Thread limit
   const threads = Number(process.env.FFMPEG_THREADS || 2);
 
-  // duration
   const dur = await ffprobeDurationSec(audioPath);
   const total = Math.max(1, dur || 60);
 
-  // Zoom (gentle)
-  const zoomPeriodSec = Number(process.env.ZOOM_PERIOD_SEC || plan.zoomPeriodSec || 10);
+  // Zoom (gentle) — ✅ zoompan 't' değil 'on' kullanır
+  const zoomPeriodSec = Number(process.env.ZOOM_PERIOD_SEC || plan.zoomPeriodSec || 8);
   const baseZoom = Number(process.env.ZOOM_BASE || plan.zoomBase || 1.01);
-  const amplZoom = Number(process.env.ZOOM_AMPL || plan.zoomAmpl || 0.006); // smaller => less shake
+  const amplZoom = Number(process.env.ZOOM_AMPL || plan.zoomAmpl || 0.008);
+  const denom = Math.max(60, Math.round(fps * zoomPeriodSec)); // on/denom
 
-  // CTA
   const ctaEnabled = Boolean(ctaPath) && (plan.cta !== false);
-  const ctaStartDur = Number(
-    process.env.CTA_START_DURATION_SEC || plan.ctaStartDurationSec || 4
-  );
+  const ctaStartDur = Number(process.env.CTA_START_DURATION_SEC || plan.ctaStartDurationSec || 4);
   const ctaEndDur = Number(process.env.CTA_DURATION_SEC || plan.ctaDurationSec || 6);
 
   const args = ["-y", "-loglevel", "warning"];
 
-  // thread limit (filter + encoder)
-  args.push(
-    "-threads",
-    String(threads),
-    "-filter_threads",
-    "1",
-    "-filter_complex_threads",
-    "1"
-  );
+  args.push("-threads", String(threads), "-filter_threads", "1", "-filter_complex_threads", "1");
 
-  // Split duration over N backgrounds
   const bgCount = Math.max(1, Math.min(6, bgPaths.length || 1));
   const segDur = total / bgCount;
 
-  // Inputs: each bg is a looped still for segDur
   for (let i = 0; i < bgCount; i++) {
-    args.push(
-      "-framerate",
-      String(fps),
-      "-loop",
-      "1",
-      "-t",
-      String(segDur + 0.25),
-      "-i",
-      bgPaths[i]
-    );
+    args.push("-framerate", String(fps), "-loop", "1", "-t", String(segDur + 0.25), "-i", bgPaths[i]);
   }
 
   if (ctaEnabled) {
-    args.push(
-      "-framerate",
-      String(fps),
-      "-loop",
-      "1",
-      "-t",
-      String(total + 0.25),
-      "-i",
-      ctaPath
-    );
+    args.push("-framerate", String(fps), "-loop", "1", "-t", String(total + 0.25), "-i", ctaPath);
   }
 
   args.push("-i", audioPath);
 
   const parts = [];
 
-  // each bg => scale/crop + zoompan (use time t for smoother motion)
   for (let i = 0; i < bgCount; i++) {
     parts.push(
       `[${i}:v]` +
@@ -445,44 +410,37 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
         `crop=${W}:${H},` +
         `format=yuv420p,` +
         `zoompan=` +
-        `z='max(1.0,${baseZoom}+${amplZoom}*sin(2*PI*t/${zoomPeriodSec}))':` +
-        `x='iw/2-(iw/zoom/2)':` +
-        `y='ih/2-(ih/zoom/2)':` +
-        `d=1:s=${W}x${H},` +
-        `fps=${fps},` +
-        `setsar=1[v${i}]`
+          `z='max(1.0,${baseZoom}+${amplZoom}*sin(2*PI*on/${denom}))':` +
+          `x='iw/2-(iw/zoom/2)':` +
+          `y='ih/2-(ih/zoom/2)':` +
+          `d=1:s=${W}x${H},` +
+        `fps=${fps},setsar=1[v${i}]`
     );
   }
 
-  // concat backgrounds
   const concatIns = Array.from({ length: bgCount }, (_, i) => `[v${i}]`).join("");
   parts.push(`${concatIns}concat=n=${bgCount}:v=1:a=0[vbg]`);
 
   let vOut = "[vbg]";
 
   if (ctaEnabled) {
-    const ctaIndex = bgCount; // after bg inputs
-    // cap CTA size (avoid heavy upscale)
+    const ctaIndex = bgCount;
     const ctaMaxW = Math.min(900, Math.round(W * 0.7));
-
     parts.push(`[${ctaIndex}:v]scale=w='min(iw,${ctaMaxW})':h=-1,format=rgba[cta]`);
 
     const startFrom = 0;
     const startTo = Math.min(total, ctaStartDur);
-
     const endFrom = Math.max(0, total - ctaEndDur);
     const endTo = total;
 
     const enableExpr =
-      `between(t,${startFrom.toFixed(3)},${startTo.toFixed(3)})+` +
-      `between(t,${endFrom.toFixed(3)},${endTo.toFixed(3)})`;
+      `between(t,${startFrom.toFixed(3)},${startTo.toFixed(3)})+between(t,${endFrom.toFixed(3)},${endTo.toFixed(3)})`;
 
     parts.push(
       `${vOut}[cta]overlay=` +
         `x=(W-w)/2:` +
         `y=H-h-40:` +
-        `enable='${enableExpr}':` +
-        `format=auto[vout]`
+        `enable='${enableExpr}':format=auto[vout]`
     );
     vOut = "[vout]";
   } else {
@@ -492,57 +450,36 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
 
   const filter = parts.join(";");
 
-  const audioIdx = ctaEnabled ? bgCount + 1 : bgCount; // audio input index
+  const audioIdx = ctaEnabled ? bgCount + 1 : bgCount;
   const gop = Number(process.env.VIDEO_GOP || plan.videoGop || fps * 2);
 
   args.push(
-    "-filter_complex",
-    filter,
-    "-map",
-    vOut,
-    "-map",
-    `${audioIdx}:a`,
+    "-filter_complex", filter,
+    "-map", vOut,
+    "-map", `${audioIdx}:a`,
 
-    "-c:v",
-    "libx264",
-    "-preset",
-    preset,
-    "-tune",
-    tune,
+    "-c:v", "libx264",
+    "-preset", preset,
+    "-tune", tune,
 
-    // HARD cap bitrate
-    "-b:v",
-    vb,
-    "-minrate",
-    minrate,
-    "-maxrate",
-    maxrate,
-    "-bufsize",
-    bufsize,
+    "-b:v", vb,
+    "-minrate", minrate,
+    "-maxrate", maxrate,
+    "-bufsize", bufsize,
 
-    // thread limit (libx264)
-    "-x264-params",
-    `threads=${threads}:lookahead-threads=1:sliced-threads=0:nal-hrd=cbr`,
+    "-x264-params", `threads=${threads}:lookahead-threads=1:sliced-threads=0:nal-hrd=cbr`,
 
-    "-g",
-    String(gop),
-    "-keyint_min",
-    String(gop),
-    "-sc_threshold",
-    "0",
+    "-g", String(gop),
+    "-keyint_min", String(gop),
+    "-sc_threshold", "0",
 
-    "-pix_fmt",
-    "yuv420p",
-    "-r",
-    String(fps),
+    "-pix_fmt", "yuv420p",
+    "-r", String(fps),
 
-    "-c:a",
-    "aac",
-    "-b:a",
-    "128k",
+    "-c:a", "aac",
+    "-b:a", "128k",
 
-    "-movflags",
-    "+faststart",
+    "-movflags", "+faststart",
     "-shortest",
     outMp4
   );
