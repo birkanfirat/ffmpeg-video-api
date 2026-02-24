@@ -45,7 +45,6 @@ setInterval(async () => {
     const now = Date.now();
     for (const [jobId, j] of jobs.entries()) {
       if (!j?.createdAt || now - j.createdAt < JOB_TTL_MS) continue;
-      // delete tmp dir
       try {
         if (j.dir) await fsp.rm(j.dir, { recursive: true, force: true });
       } catch (_) {}
@@ -161,7 +160,6 @@ async function trimTrailingSilence(inWav, outWav) {
     "-i",
     inWav,
     "-af",
-    // trailing silence only
     "areverse,silenceremove=stop_periods=-1:stop_duration=0.6:stop_threshold=-45dB,areverse,asetpts=N/SR/TB",
     "-ar",
     "48000",
@@ -194,10 +192,7 @@ let _gcpClient = null;
 function getGcpClient() {
   if (_gcpClient) return _gcpClient;
 
-  // 1) standard JSON env
   const rawJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-
-  // 2) base64 of service account JSON
   const b64 = process.env.GCP_TTS_KEY_B64;
 
   if (rawJson) {
@@ -231,7 +226,6 @@ function getGcpClient() {
     return _gcpClient;
   }
 
-  // 3) fallback: GOOGLE_APPLICATION_CREDENTIALS file path (ADC)
   if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
     _gcpClient = new textToSpeech.TextToSpeechClient();
     return _gcpClient;
@@ -247,7 +241,6 @@ async function ttsTrToWav(text, wavPath) {
   const speakingRate = Number(process.env.GCP_TTS_RATE || "1.0");
   const pitch = Number(process.env.GCP_TTS_PITCH || "0");
 
-  // Google first
   try {
     const client = getGcpClient();
     const request = {
@@ -265,7 +258,6 @@ async function ttsTrToWav(text, wavPath) {
     await writeFileSafe(wavPath, Buffer.from(response.audioContent));
     return;
   } catch (e) {
-    // fallback OpenAI (opsiyonel)
     if (!openai) throw e;
 
     const voice = process.env.OPENAI_TTS_VOICE || "marin";
@@ -289,7 +281,6 @@ async function ttsTrToWav(text, wavPath) {
 
 // ---------- VIDEO RENDER ----------
 
-// MIME -> ext
 function pickExtByMime(mime) {
   const m = String(mime || "").toLowerCase();
   if (m.includes("png")) return ".png";
@@ -341,7 +332,6 @@ function pickBgFiles(files) {
 
   if (bgs.length) return bgs;
 
-  // fallback: single "image"
   const single =
     arr.find((f) => String(f.fieldname).toLowerCase() === "image" && f.buffer) ||
     arr.find((f) => String(f.fieldname).toLowerCase() === "bg1" && f.buffer);
@@ -351,10 +341,8 @@ function pickBgFiles(files) {
 
 // Create MP4 from bg list + audio + optional CTA.
 // Fixes:
-// - bitrate hard cap => file size normal
-// - consistent fps (no "deprem" titreme)
-// - gentler zoom using time "t"
-// - CTA at BEGINNING + END
+// - zoom jitter reduced (integer x/y, fps single source)
+// - CTA at bottom (not center) + alpha safe
 
 async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPath = null) {
   const W = Number(process.env.VIDEO_W || plan.videoW || 1280);
@@ -374,7 +362,7 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
   const dur = await ffprobeDurationSec(audioPath);
   const total = Math.max(1, dur || 60);
 
-  // Zoom (gentle) — ✅ zoompan 't' değil 'on' kullanır
+  // Zoom parameters
   const zoomPeriodSec = Number(process.env.ZOOM_PERIOD_SEC || plan.zoomPeriodSec || 8);
   const baseZoom = Number(process.env.ZOOM_BASE || plan.zoomBase || 1.01);
   const amplZoom = Number(process.env.ZOOM_AMPL || plan.zoomAmpl || 0.008);
@@ -383,6 +371,7 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
   const ctaEnabled = Boolean(ctaPath) && (plan.cta !== false);
   const ctaStartDur = Number(process.env.CTA_START_DURATION_SEC || plan.ctaStartDurationSec || 4);
   const ctaEndDur = Number(process.env.CTA_DURATION_SEC || plan.ctaDurationSec || 6);
+  const ctaBottomMargin = Number(process.env.CTA_BOTTOM_MARGIN || plan.ctaBottomMargin || 24);
 
   const args = ["-y", "-loglevel", "warning"];
 
@@ -411,10 +400,11 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
         `format=yuv420p,` +
         `zoompan=` +
           `z='max(1.0,${baseZoom}+${amplZoom}*sin(2*PI*on/${denom}))':` +
-          `x='iw/2-(iw/zoom/2)':` +
-          `y='ih/2-(ih/zoom/2)':` +
-          `d=1:s=${W}x${H},` +
-        `fps=${fps},setsar=1[v${i}]`
+          // ✅ jitter fix: integer positions
+          `x='trunc((iw-iw/zoom)/2)':` +
+          `y='trunc((ih-ih/zoom)/2)':` +
+          `d=1:s=${W}x${H}:fps=${fps},` +
+        `setsar=1,setpts=PTS-STARTPTS[v${i}]`
     );
   }
 
@@ -426,6 +416,7 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
   if (ctaEnabled) {
     const ctaIndex = bgCount;
     const ctaMaxW = Math.min(900, Math.round(W * 0.7));
+
     parts.push(`[${ctaIndex}:v]scale=w='min(iw,${ctaMaxW})':h=-1,format=rgba[cta]`);
 
     const startFrom = 0;
@@ -436,12 +427,16 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
     const enableExpr =
       `between(t,${startFrom.toFixed(3)},${startTo.toFixed(3)})+between(t,${endFrom.toFixed(3)},${endTo.toFixed(3)})`;
 
+    // ✅ alpha safe + bottom placement
+    parts.push(`${vOut}format=rgba[base]`);
     parts.push(
-      `${vOut}[cta]overlay=` +
-        `x=(W-w)/2:` +
-        `y=H-h-40:` +
-        `enable='${enableExpr}':format=auto[vout]`
+      `[base][cta]overlay=` +
+        `x=(main_w-overlay_w)/2:` +
+        `y=main_h-overlay_h-${ctaBottomMargin}:` +
+        `enable='${enableExpr}':format=auto,` +
+        `format=yuv420p[vout]`
     );
+
     vOut = "[vout]";
   } else {
     parts.push(`${vOut}format=yuv420p[vout]`);
@@ -501,13 +496,11 @@ async function processJob(jobId, jobDir, bgPaths, plan, ctaPath) {
       throw new Error("Plan.segments boş veya yok");
     }
 
-    // Optional enforcement: cap ayah count on server too (safety)
     const maxAyah = Number(process.env.MAX_AYAH || plan.maxAyah || 0);
     if (maxAyah > 0 && plan.segments.length > maxAyah) {
       plan.segments = plan.segments.slice(0, maxAyah);
     }
 
-    // Build clips
     const clipsDir = path.join(jobDir, "clips");
     await fsp.mkdir(clipsDir, { recursive: true });
 
@@ -542,7 +535,6 @@ async function processJob(jobId, jobDir, bgPaths, plan, ctaPath) {
       wavs.push(wav);
     };
 
-    // Intro + announce + bismillah + segments + outro
     setStage(jobId, "tts_intro");
     if (plan.introText) await addTtsClip(plan.introText, "intro");
 
@@ -570,7 +562,6 @@ async function processJob(jobId, jobDir, bgPaths, plan, ctaPath) {
 
     if (wavs.length === 0) throw new Error("Hiç audio clip üretilmedi");
 
-    // concat list file
     setStage(jobId, "concat");
     const listPath = path.join(jobDir, "list.txt");
     const listBody = wavs.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join("\n");
@@ -579,17 +570,14 @@ async function processJob(jobId, jobDir, bgPaths, plan, ctaPath) {
     const concatWav = path.join(jobDir, "concat.wav");
     await concatWavs(listPath, concatWav);
 
-    // trailing silence temizle
     setStage(jobId, "trim_silence");
     const finalWav = path.join(jobDir, "final_nosilence.wav");
     await trimTrailingSilence(concatWav, finalWav);
 
-    // encode audio
     setStage(jobId, "encode_audio");
     const audioM4a = path.join(jobDir, "audio.m4a");
     await wavToM4a(finalWav, audioM4a);
 
-    // render mp4
     setStage(jobId, "render_mp4");
     const outMp4 = path.join(jobDir, "output.mp4");
     await imagesPlusAudioToMp4(bgPaths, audioM4a, outMp4, plan, ctaPath);
@@ -620,7 +608,6 @@ app.post("/render10min/start", upload.any(), async (req, res) => {
   try {
     const files = Array.isArray(req.files) ? req.files : [];
 
-    // ✅ BG required (bg1..bg6 OR image)
     const bgFiles = pickBgFiles(files);
     if (!bgFiles.length) {
       return res.status(400).json({
@@ -644,7 +631,6 @@ app.post("/render10min/start", upload.any(), async (req, res) => {
     const jobDir = path.join(os.tmpdir(), `render10min_${jobId}`);
     await fsp.mkdir(jobDir, { recursive: true });
 
-    // write BG(s) with correct extension
     const bgPaths = [];
     for (let i = 0; i < Math.min(6, bgFiles.length); i++) {
       const f = bgFiles[i];
@@ -654,7 +640,6 @@ app.post("/render10min/start", upload.any(), async (req, res) => {
       bgPaths.push(p);
     }
 
-    // CTA optional
     const ctaPath = await resolveCta(jobDir, files);
 
     jobs.set(jobId, {
