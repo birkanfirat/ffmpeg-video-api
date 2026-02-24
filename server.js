@@ -1,6 +1,6 @@
 /* server.js
  * Endpoints:
- *  POST /render10min/start   (multipart: bg1 (+ optional cta) + plan JSON string)
+ *  POST /render10min/start   (multipart: bg1..bg6 OR image, optional cta, + plan JSON string)
  *  GET  /render10min/status/:jobId   -> { status: "processing"|"done"|"error", stage?, error? }
  *  GET  /render10min/result/:jobId   -> mp4 file stream
  */
@@ -29,11 +29,30 @@ const openai = process.env.OPENAI_API_KEY
 // Multer: keep files in memory then write to job folder
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 30 * 1024 * 1024 }, // 30MB
+  limits: {
+    fileSize: Number(process.env.UPLOAD_MAX_BYTES || 30 * 1024 * 1024), // 30MB default per file
+    files: 12,
+  },
 });
 
 // In-memory job store (Railway restart -> reset)
 const jobs = new Map();
+
+// cleanup old tmp folders (best-effort)
+const JOB_TTL_MS = Number(process.env.JOB_TTL_MS || 2 * 60 * 60 * 1000); // 2h
+setInterval(async () => {
+  try {
+    const now = Date.now();
+    for (const [jobId, j] of jobs.entries()) {
+      if (!j?.createdAt || now - j.createdAt < JOB_TTL_MS) continue;
+      // delete tmp dir
+      try {
+        if (j.dir) await fsp.rm(j.dir, { recursive: true, force: true });
+      } catch (_) {}
+      jobs.delete(jobId);
+    }
+  } catch (_) {}
+}, 10 * 60 * 1000).unref();
 
 function uid() {
   return crypto.randomUUID
@@ -48,32 +67,37 @@ function runCmd(bin, args, opts = {}) {
 
     let out = "";
     let err = "";
-    const ERR_LIMIT = 64 * 1024; // keep last 64KB only
+    const LIMIT = 64 * 1024; // keep last 64KB only
 
     p.stdout.on("data", (d) => {
       out += d.toString();
-      if (out.length > ERR_LIMIT) out = out.slice(out.length - ERR_LIMIT);
+      if (out.length > LIMIT) out = out.slice(out.length - LIMIT);
     });
 
     p.stderr.on("data", (d) => {
       err += d.toString();
-      if (err.length > ERR_LIMIT) err = err.slice(err.length - ERR_LIMIT);
+      if (err.length > LIMIT) err = err.slice(err.length - LIMIT);
     });
 
     p.on("error", reject);
     p.on("close", (code, signal) => {
       if (code === 0) return resolve({ out, err });
       const extra = signal ? ` (signal=${signal})` : "";
-      reject(new Error(`${bin} ${args.join(" ")} failed (code=${code}${extra}):\n${err}`));
+      reject(
+        new Error(`${bin} ${args.join(" ")} failed (code=${code}${extra}):\n${err}`)
+      );
     });
   });
 }
 
 async function ffprobeDurationSec(filePath) {
   const args = [
-    "-v", "error",
-    "-show_entries", "format=duration",
-    "-of", "default=noprint_wrappers=1:nokey=1",
+    "-v",
+    "error",
+    "-show_entries",
+    "format=duration",
+    "-of",
+    "default=noprint_wrappers=1:nokey=1",
     filePath,
   ];
   const { out } = await runCmd("ffprobe", args);
@@ -97,11 +121,16 @@ async function downloadToFile(url, filePath) {
 async function normalizeToWav(inPath, outWav) {
   await runCmd("ffmpeg", [
     "-y",
-    "-loglevel", "error",
-    "-i", inPath,
-    "-ar", "48000",
-    "-ac", "1",
-    "-c:a", "pcm_s16le",
+    "-loglevel",
+    "error",
+    "-i",
+    inPath,
+    "-ar",
+    "48000",
+    "-ac",
+    "1",
+    "-c:a",
+    "pcm_s16le",
     outWav,
   ]);
 }
@@ -109,26 +138,37 @@ async function normalizeToWav(inPath, outWav) {
 async function concatWavs(listFilePath, outWav) {
   await runCmd("ffmpeg", [
     "-y",
-    "-loglevel", "error",
-    "-f", "concat",
-    "-safe", "0",
-    "-i", listFilePath,
-    "-c:a", "pcm_s16le",
+    "-loglevel",
+    "error",
+    "-f",
+    "concat",
+    "-safe",
+    "0",
+    "-i",
+    listFilePath,
+    "-c:a",
+    "pcm_s16le",
     outWav,
   ]);
 }
 
-// Cut trailing silence
+// Cut trailing silence (no need to remove leading)
 async function trimTrailingSilence(inWav, outWav) {
   await runCmd("ffmpeg", [
     "-y",
-    "-loglevel", "error",
-    "-i", inWav,
+    "-loglevel",
+    "error",
+    "-i",
+    inWav,
     "-af",
-    "silenceremove=stop_periods=-1:stop_duration=0.6:stop_threshold=-45dB,asetpts=N/SR/TB",
-    "-ar", "48000",
-    "-ac", "1",
-    "-c:a", "pcm_s16le",
+    // trailing silence only
+    "areverse,silenceremove=stop_periods=-1:stop_duration=0.6:stop_threshold=-45dB,areverse,asetpts=N/SR/TB",
+    "-ar",
+    "48000",
+    "-ac",
+    "1",
+    "-c:a",
+    "pcm_s16le",
     outWav,
   ]);
 }
@@ -136,10 +176,14 @@ async function trimTrailingSilence(inWav, outWav) {
 async function wavToM4a(inWav, outM4a) {
   await runCmd("ffmpeg", [
     "-y",
-    "-loglevel", "error",
-    "-i", inWav,
-    "-c:a", "aac",
-    "-b:a", "192k",
+    "-loglevel",
+    "error",
+    "-i",
+    inWav,
+    "-c:a",
+    "aac",
+    "-b:a",
+    "192k",
     outM4a,
   ]);
 }
@@ -153,7 +197,7 @@ function getGcpClient() {
   // 1) standard JSON env
   const rawJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
 
-  // 2) your Railway variable: base64 of service account JSON
+  // 2) base64 of service account JSON
   const b64 = process.env.GCP_TTS_KEY_B64;
 
   if (rawJson) {
@@ -208,10 +252,7 @@ async function ttsTrToWav(text, wavPath) {
     const client = getGcpClient();
     const request = {
       input: { text: String(text || "") },
-      voice: {
-        languageCode: "tr-TR",
-        name: voiceName,
-      },
+      voice: { languageCode: "tr-TR", name: voiceName },
       audioConfig: {
         audioEncoding: "LINEAR16",
         speakingRate,
@@ -246,137 +287,15 @@ async function ttsTrToWav(text, wavPath) {
   }
 }
 
-// ---- single image + subtle zoom in/out + optional CTA at end ----
-async function imagePlusAudioToMp4Single(bgPath, audioPath, outMp4, plan = {}, ctaPath = null) {
-  // Railway-safe defaults
-  const W = Number(process.env.VIDEO_W || plan.videoW || 1280);
-  const H = Number(process.env.VIDEO_H || plan.videoH || 720);
-  const fps = Number(process.env.VIDEO_FPS || plan.videoFps || 25);
+// ---------- VIDEO RENDER ----------
 
-  // CPU'yu düşür: preset + thread limit (SIGKILL'in #1 sebebi bu)
-  const preset = process.env.VIDEO_PRESET || plan.videoPreset || "ultrafast"; // ✅ CPU düşük
-  const crf = Number(process.env.VIDEO_CRF || plan.videoCrf || 28);
-
-  // Boyut kontrolü (cap): 10dk için makul
-  const maxrate = process.env.VIDEO_MAXRATE || plan.videoMaxrate || "2000k";
-  const bufsize = process.env.VIDEO_BUFSIZE || plan.videoBufsize || "4000k";
-  const tune = process.env.VIDEO_TUNE || plan.videoTune || "stillimage";
-
-  // Thread limit
-  const threads = Number(process.env.FFMPEG_THREADS || 2); // ✅ Railway'de 1-2 ideal
-
-  const dur = await ffprobeDurationSec(audioPath);
-  const total = Math.max(1, dur || 60);
-
-  // Zoom daha hafif
-  const zoomPeriodSec = Number(process.env.ZOOM_PERIOD_SEC || plan.zoomPeriodSec || 10);
-  const baseZoom = Number(process.env.ZOOM_BASE || plan.zoomBase || 1.01);
-  const amplZoom = Number(process.env.ZOOM_AMPL || plan.zoomAmpl || 0.008);
-  const denom = Math.max(60, Math.round(fps * zoomPeriodSec));
-
-  const ctaEnabled = Boolean(ctaPath) && (plan.cta !== false);
-  const ctaDur = Number(process.env.CTA_DURATION_SEC || plan.ctaDurationSec || 6);
-
-  const args = ["-y", "-loglevel", "warning"];
-
-  // ✅ thread limit (hem filtre hem encoder tarafı)
-  args.push(
-    "-threads", String(threads),
-    "-filter_threads", "1",
-    "-filter_complex_threads", "1"
-  );
-
-  // ✅ image input fps sabitle (25/30 karışımı titreme + yük yapıyordu)
-  args.push("-framerate", String(fps), "-loop", "1", "-t", String(total + 0.25), "-i", bgPath);
-
-  if (ctaEnabled) {
-    args.push("-framerate", String(fps), "-loop", "1", "-t", String(total + 0.25), "-i", ctaPath);
-  }
-
-  args.push("-i", audioPath);
-
-  const parts = [];
-
-  // bg: scale/crop + zoompan
-  parts.push(
-    `[0:v]` +
-      `scale=${W}:${H}:force_original_aspect_ratio=increase,` +
-      `crop=${W}:${H},` +
-      `format=yuv420p,` +
-      `zoompan=` +
-        `z='max(1.0,${baseZoom}+${amplZoom}*sin(2*PI*on/${denom}))':` +
-        `x='(iw-iw/zoom)/2':` +
-        `y='(ih-ih/zoom)/2':` +
-        `d=1:s=${W}x${H},` +
-      `setsar=1[vbg]`
-  );
-
-  let vOut = "[vbg]";
-
-  if (ctaEnabled) {
-    const enableFrom = Math.max(0, total - ctaDur);
-    const enableTo = total;
-
-    // ✅ CTA'yı 1920’ye büyütme: overlay maliyetini düşür
-    parts.push(`[1:v]scale=w='min(iw,800)':h=-1,format=rgba[cta]`);
-
-    parts.push(
-      `${vOut}[cta]overlay=` +
-        `x=(W-w)/2:` +
-        `y=H-h-40:` +
-        `enable='between(t,${enableFrom.toFixed(3)},${enableTo.toFixed(3)})':` +
-        `format=auto[vout]`
-    );
-    vOut = "[vout]";
-  } else {
-    parts.push(`${vOut}format=yuv420p[vout]`);
-    vOut = "[vout]";
-  }
-
-  const filter = parts.join(";");
-
-  const audioIdx = ctaEnabled ? 2 : 1;
-  const gop = Number(process.env.VIDEO_GOP || plan.videoGop || (fps * 2));
-
-  args.push(
-    "-filter_complex", filter,
-    "-map", vOut,
-    "-map", `${audioIdx}:a`,
-
-    "-c:v", "libx264",
-    "-preset", preset,
-    "-tune", tune,
-    "-crf", String(crf),
-
-    // ✅ boyut cap
-    "-maxrate", maxrate,
-    "-bufsize", bufsize,
-
-    // ✅ encoder thread limit (libx264)
-    "-x264-params", `threads=${threads}:lookahead-threads=1:sliced-threads=0`,
-
-    "-g", String(gop),
-    "-keyint_min", String(gop),
-    "-sc_threshold", "0",
-
-    "-pix_fmt", "yuv420p",
-    "-r", String(fps),
-
-    "-c:a", "aac",
-    "-b:a", "128k",
-
-    "-movflags", "+faststart",
-    "-shortest",
-    outMp4
-  );
-
-  await runCmd("ffmpeg", args);
-}
-
-function setStage(jobId, stage) {
-  const j = jobs.get(jobId);
-  if (!j) return;
-  j.stage = stage;
+// MIME -> ext
+function pickExtByMime(mime) {
+  const m = String(mime || "").toLowerCase();
+  if (m.includes("png")) return ".png";
+  if (m.includes("jpeg") || m.includes("jpg")) return ".jpg";
+  if (m.includes("webp")) return ".webp";
+  return ".img";
 }
 
 // Resolve CTA image:
@@ -384,7 +303,9 @@ function setStage(jobId, stage) {
 // 2) local file assets/cta.png
 // 3) env CTA_IMAGE_URL (download)
 async function resolveCta(jobDir, files) {
-  const ctaFile = (files || []).find((f) => String(f.fieldname).toLowerCase() === "cta" && f.buffer);
+  const ctaFile = (files || []).find(
+    (f) => String(f.fieldname).toLowerCase() === "cta" && f.buffer
+  );
   if (ctaFile) {
     const p = path.join(jobDir, "cta.png");
     await writeFileSafe(p, ctaFile.buffer);
@@ -407,20 +328,246 @@ async function resolveCta(jobDir, files) {
   return null;
 }
 
-function pickExtByMime(mime) {
-  const m = String(mime || "").toLowerCase();
-  if (m.includes("png")) return ".png";
-  if (m.includes("jpeg") || m.includes("jpg")) return ".jpg";
-  if (m.includes("webp")) return ".webp";
-  return ".img";
+// Accept bg1..bg6 OR image
+function pickBgFiles(files) {
+  const arr = Array.isArray(files) ? files : [];
+  const bgs = arr
+    .filter((f) => f?.buffer && /^bg[1-6]$/i.test(String(f.fieldname || "")))
+    .sort((a, b) => {
+      const ai = Number(String(a.fieldname).slice(2)) || 0;
+      const bi = Number(String(b.fieldname).slice(2)) || 0;
+      return ai - bi;
+    });
+
+  if (bgs.length) return bgs;
+
+  // fallback: single "image"
+  const single =
+    arr.find((f) => String(f.fieldname).toLowerCase() === "image" && f.buffer) ||
+    arr.find((f) => String(f.fieldname).toLowerCase() === "bg1" && f.buffer);
+
+  return single ? [single] : [];
 }
 
-async function processJob(jobId, jobDir, bgPath, plan, ctaPath) {
+// Create MP4 from bg list + audio + optional CTA.
+// Fixes:
+// - bitrate hard cap => file size normal
+// - consistent fps (no "deprem" titreme)
+// - gentler zoom using time "t"
+// - CTA at BEGINNING + END
+async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPath = null) {
+  // Defaults (keep small for Railway stability)
+  const W = Number(process.env.VIDEO_W || plan.videoW || 1280);
+  const H = Number(process.env.VIDEO_H || plan.videoH || 720);
+  const fps = Number(process.env.VIDEO_FPS || plan.videoFps || 25);
+
+  // CPU lower
+  const preset = process.env.VIDEO_PRESET || plan.videoPreset || "ultrafast";
+  const tune = process.env.VIDEO_TUNE || plan.videoTune || "stillimage";
+
+  // HARD bitrate cap (prevents 2.38GB surprises)
+  const vb = process.env.VIDEO_BITRATE || plan.videoBitrate || "1800k";
+  const maxrate = process.env.VIDEO_MAXRATE || plan.videoMaxrate || vb;
+  const minrate = process.env.VIDEO_MINRATE || plan.videoMinrate || vb;
+  const bufsize = process.env.VIDEO_BUFSIZE || plan.videoBufsize || "3600k";
+
+  // Thread limit
+  const threads = Number(process.env.FFMPEG_THREADS || 2);
+
+  // duration
+  const dur = await ffprobeDurationSec(audioPath);
+  const total = Math.max(1, dur || 60);
+
+  // Zoom (gentle)
+  const zoomPeriodSec = Number(process.env.ZOOM_PERIOD_SEC || plan.zoomPeriodSec || 10);
+  const baseZoom = Number(process.env.ZOOM_BASE || plan.zoomBase || 1.01);
+  const amplZoom = Number(process.env.ZOOM_AMPL || plan.zoomAmpl || 0.006); // smaller => less shake
+
+  // CTA
+  const ctaEnabled = Boolean(ctaPath) && (plan.cta !== false);
+  const ctaStartDur = Number(
+    process.env.CTA_START_DURATION_SEC || plan.ctaStartDurationSec || 4
+  );
+  const ctaEndDur = Number(process.env.CTA_DURATION_SEC || plan.ctaDurationSec || 6);
+
+  const args = ["-y", "-loglevel", "warning"];
+
+  // thread limit (filter + encoder)
+  args.push(
+    "-threads",
+    String(threads),
+    "-filter_threads",
+    "1",
+    "-filter_complex_threads",
+    "1"
+  );
+
+  // Split duration over N backgrounds
+  const bgCount = Math.max(1, Math.min(6, bgPaths.length || 1));
+  const segDur = total / bgCount;
+
+  // Inputs: each bg is a looped still for segDur
+  for (let i = 0; i < bgCount; i++) {
+    args.push(
+      "-framerate",
+      String(fps),
+      "-loop",
+      "1",
+      "-t",
+      String(segDur + 0.25),
+      "-i",
+      bgPaths[i]
+    );
+  }
+
+  if (ctaEnabled) {
+    args.push(
+      "-framerate",
+      String(fps),
+      "-loop",
+      "1",
+      "-t",
+      String(total + 0.25),
+      "-i",
+      ctaPath
+    );
+  }
+
+  args.push("-i", audioPath);
+
+  const parts = [];
+
+  // each bg => scale/crop + zoompan (use time t for smoother motion)
+  for (let i = 0; i < bgCount; i++) {
+    parts.push(
+      `[${i}:v]` +
+        `scale=${W}:${H}:force_original_aspect_ratio=increase,` +
+        `crop=${W}:${H},` +
+        `format=yuv420p,` +
+        `zoompan=` +
+        `z='max(1.0,${baseZoom}+${amplZoom}*sin(2*PI*t/${zoomPeriodSec}))':` +
+        `x='iw/2-(iw/zoom/2)':` +
+        `y='ih/2-(ih/zoom/2)':` +
+        `d=1:s=${W}x${H},` +
+        `fps=${fps},` +
+        `setsar=1[v${i}]`
+    );
+  }
+
+  // concat backgrounds
+  const concatIns = Array.from({ length: bgCount }, (_, i) => `[v${i}]`).join("");
+  parts.push(`${concatIns}concat=n=${bgCount}:v=1:a=0[vbg]`);
+
+  let vOut = "[vbg]";
+
+  if (ctaEnabled) {
+    const ctaIndex = bgCount; // after bg inputs
+    // cap CTA size (avoid heavy upscale)
+    const ctaMaxW = Math.min(900, Math.round(W * 0.7));
+
+    parts.push(`[${ctaIndex}:v]scale=w='min(iw,${ctaMaxW})':h=-1,format=rgba[cta]`);
+
+    const startFrom = 0;
+    const startTo = Math.min(total, ctaStartDur);
+
+    const endFrom = Math.max(0, total - ctaEndDur);
+    const endTo = total;
+
+    const enableExpr =
+      `between(t,${startFrom.toFixed(3)},${startTo.toFixed(3)})+` +
+      `between(t,${endFrom.toFixed(3)},${endTo.toFixed(3)})`;
+
+    parts.push(
+      `${vOut}[cta]overlay=` +
+        `x=(W-w)/2:` +
+        `y=H-h-40:` +
+        `enable='${enableExpr}':` +
+        `format=auto[vout]`
+    );
+    vOut = "[vout]";
+  } else {
+    parts.push(`${vOut}format=yuv420p[vout]`);
+    vOut = "[vout]";
+  }
+
+  const filter = parts.join(";");
+
+  const audioIdx = ctaEnabled ? bgCount + 1 : bgCount; // audio input index
+  const gop = Number(process.env.VIDEO_GOP || plan.videoGop || fps * 2);
+
+  args.push(
+    "-filter_complex",
+    filter,
+    "-map",
+    vOut,
+    "-map",
+    `${audioIdx}:a`,
+
+    "-c:v",
+    "libx264",
+    "-preset",
+    preset,
+    "-tune",
+    tune,
+
+    // HARD cap bitrate
+    "-b:v",
+    vb,
+    "-minrate",
+    minrate,
+    "-maxrate",
+    maxrate,
+    "-bufsize",
+    bufsize,
+
+    // thread limit (libx264)
+    "-x264-params",
+    `threads=${threads}:lookahead-threads=1:sliced-threads=0:nal-hrd=cbr`,
+
+    "-g",
+    String(gop),
+    "-keyint_min",
+    String(gop),
+    "-sc_threshold",
+    "0",
+
+    "-pix_fmt",
+    "yuv420p",
+    "-r",
+    String(fps),
+
+    "-c:a",
+    "aac",
+    "-b:a",
+    "128k",
+
+    "-movflags",
+    "+faststart",
+    "-shortest",
+    outMp4
+  );
+
+  await runCmd("ffmpeg", args);
+}
+
+function setStage(jobId, stage) {
+  const j = jobs.get(jobId);
+  if (!j) return;
+  j.stage = stage;
+}
+
+async function processJob(jobId, jobDir, bgPaths, plan, ctaPath) {
   try {
     setStage(jobId, "prepare");
 
     if (!plan || !Array.isArray(plan.segments) || plan.segments.length === 0) {
       throw new Error("Plan.segments boş veya yok");
+    }
+
+    // Optional enforcement: cap ayah count on server too (safety)
+    const maxAyah = Number(process.env.MAX_AYAH || plan.maxAyah || 0);
+    if (maxAyah > 0 && plan.segments.length > maxAyah) {
+      plan.segments = plan.segments.slice(0, maxAyah);
     }
 
     // Build clips
@@ -431,16 +578,28 @@ async function processJob(jobId, jobDir, bgPath, plan, ctaPath) {
     let idx = 0;
 
     const addTtsClip = async (text, name) => {
-      const raw = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}_raw.wav`);
-      const norm = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}.wav`);
+      const raw = path.join(
+        clipsDir,
+        `${String(idx++).padStart(3, "0")}_${name}_raw.wav`
+      );
+      const norm = path.join(
+        clipsDir,
+        `${String(idx++).padStart(3, "0")}_${name}.wav`
+      );
       await ttsTrToWav(text, raw);
       await normalizeToWav(raw, norm);
       wavs.push(norm);
     };
 
     const addMp3UrlClip = async (url, name) => {
-      const mp3 = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}.mp3`);
-      const wav = path.join(clipsDir, `${String(idx++).padStart(3, "0")}_${name}.wav`);
+      const mp3 = path.join(
+        clipsDir,
+        `${String(idx++).padStart(3, "0")}_${name}.mp3`
+      );
+      const wav = path.join(
+        clipsDir,
+        `${String(idx++).padStart(3, "0")}_${name}.wav`
+      );
       await downloadToFile(url, mp3);
       await normalizeToWav(mp3, wav);
       wavs.push(wav);
@@ -496,7 +655,7 @@ async function processJob(jobId, jobDir, bgPath, plan, ctaPath) {
     // render mp4
     setStage(jobId, "render_mp4");
     const outMp4 = path.join(jobDir, "output.mp4");
-    await imagePlusAudioToMp4Single(bgPath, audioM4a, outMp4, plan, ctaPath);
+    await imagesPlusAudioToMp4(bgPaths, audioM4a, outMp4, plan, ctaPath);
 
     setStage(jobId, "verify");
     const dur = await ffprobeDurationSec(outMp4);
@@ -524,14 +683,11 @@ app.post("/render10min/start", upload.any(), async (req, res) => {
   try {
     const files = Array.isArray(req.files) ? req.files : [];
 
-    // ✅ BG required (bg1 or image)
-    const bgFile =
-      files.find((f) => String(f.fieldname).toLowerCase() === "bg1" && f.buffer) ||
-      files.find((f) => String(f.fieldname).toLowerCase() === "image" && f.buffer);
-
-    if (!bgFile) {
+    // ✅ BG required (bg1..bg6 OR image)
+    const bgFiles = pickBgFiles(files);
+    if (!bgFiles.length) {
       return res.status(400).json({
-        error: "Missing required files. Need bg1 (or image) + plan. (audio upload is NOT required)",
+        error: "Missing required files. Need bg1..bg6 (or image) + plan. (audio upload is NOT required)",
         got: files.map((f) => f.fieldname),
       });
     }
@@ -543,7 +699,7 @@ app.post("/render10min/start", upload.any(), async (req, res) => {
     let plan;
     try {
       plan = JSON.parse(req.body.plan);
-    } catch (e) {
+    } catch (_) {
       return res.status(400).json({ error: "Plan JSON parse error" });
     }
 
@@ -551,10 +707,15 @@ app.post("/render10min/start", upload.any(), async (req, res) => {
     const jobDir = path.join(os.tmpdir(), `render10min_${jobId}`);
     await fsp.mkdir(jobDir, { recursive: true });
 
-    // write BG with correct extension
-    const ext = pickExtByMime(bgFile.mimetype);
-    const bgPath = path.join(jobDir, `bg_01${ext}`);
-    await writeFileSafe(bgPath, bgFile.buffer);
+    // write BG(s) with correct extension
+    const bgPaths = [];
+    for (let i = 0; i < Math.min(6, bgFiles.length); i++) {
+      const f = bgFiles[i];
+      const ext = pickExtByMime(f.mimetype);
+      const p = path.join(jobDir, `bg_${String(i + 1).padStart(2, "0")}${ext}`);
+      await writeFileSafe(p, f.buffer);
+      bgPaths.push(p);
+    }
 
     // CTA optional
     const ctaPath = await resolveCta(jobDir, files);
@@ -566,9 +727,13 @@ app.post("/render10min/start", upload.any(), async (req, res) => {
       createdAt: Date.now(),
     });
 
-    setImmediate(() => processJob(jobId, jobDir, bgPath, plan, ctaPath));
+    setImmediate(() => processJob(jobId, jobDir, bgPaths, plan, ctaPath));
 
-    res.json({ jobId, bg: path.basename(bgPath), cta: Boolean(ctaPath) });
+    res.json({
+      jobId,
+      bgCount: bgPaths.length,
+      cta: Boolean(ctaPath),
+    });
   } catch (err) {
     res.status(500).json({ error: err?.message || String(err) });
   }
@@ -579,8 +744,9 @@ app.get("/render10min/status/:jobId", (req, res) => {
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ status: "error", error: "job_not_found" });
 
-  if (job.status === "error")
+  if (job.status === "error") {
     return res.json({ status: "error", error: job.error || "unknown", stage: job.stage });
+  }
   if (job.status === "done") return res.json({ status: "done", stage: job.stage });
 
   return res.json({ status: "processing", stage: job.stage });
