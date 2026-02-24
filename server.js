@@ -371,15 +371,18 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
   const dur = await ffprobeDurationSec(audioPath);
   const total = Math.max(1, dur || 60);
 
-  // Zoom: net görünür aralık
+  // ✅ Zoom aralığı (gözle görülür)
   const zoomMin = Number(process.env.ZOOM_MIN || plan.zoomMin || 1.00);
   const zoomMax = Number(process.env.ZOOM_MAX || plan.zoomMax || 1.08);
   const period = Number(process.env.ZOOM_PERIOD_SEC || plan.zoomPeriodSec || 12);
 
-  // Overscan: zoom-out sırasında kenar göstermesin
+  // ✅ Overscan
   const overscan = Number(process.env.ZOOM_OVERSCAN || plan.zoomOverscan || 1.12);
   const bigW = Math.round(W * overscan);
   const bigH = Math.round(H * overscan);
+
+  // ✅ shimmer breaker (çok hafif)
+  const gblurSigma = Number(process.env.ZOOM_GBLUR_SIGMA || plan.zoomGblurSigma || 0.25);
 
   // CTA
   const ctaEnabled = Boolean(ctaPath) && (plan.cta !== false);
@@ -390,10 +393,12 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
   const args = ["-y", "-loglevel", "warning"];
   args.push("-threads", String(threads), "-filter_threads", "1", "-filter_complex_threads", "1");
 
+  // ✅ global sws flag (uyumlu ve stabil)
+  args.push("-sws_flags", "bicubic+accurate_rnd");
+
   const bgCount = Math.max(1, Math.min(6, bgPaths.length || 1));
   const segDur = total / bgCount;
 
-  // still images
   for (let i = 0; i < bgCount; i++) {
     args.push("-loop", "1", "-t", String(segDur + 0.25), "-i", bgPaths[i]);
   }
@@ -405,37 +410,41 @@ async function imagesPlusAudioToMp4(bgPaths, audioPath, outMp4, plan = {}, ctaPa
   const parts = [];
 
   for (let i = 0; i < bgCount; i++) {
-    // Easing zoom (cos): zoomMin..zoomMax
+    // ✅ cos easing zoom (t burada var, scale eval=frame ile çalışıyor)
     const z = `${zoomMin}+(${zoomMax}-${zoomMin})*(0.5-0.5*cos(2*PI*t/${period}))`;
 
-    // merkez crop x/y (even pixel lock)
+    // crop merkez (even pixel lock)
     const x = `trunc(((in_w-${W})/2)/2)*2`;
     const y = `trunc(((in_h-${H})/2)/2)*2`;
 
+    const blurPart = gblurSigma > 0 ? `gblur=sigma=${gblurSigma}:steps=1,` : "";
+
     parts.push(
       `[${i}:v]` +
-        `scale=${bigW}:${bigH}:force_original_aspect_ratio=increase:flags=spline36,` +
+        // 1) overscan sabitle (bicubic)
+        `scale=${bigW}:${bigH}:force_original_aspect_ratio=increase,` +
         `crop=${bigW}:${bigH},` +
-        `format=rgb24,` +
-        `scale=w='iw*(${z})':h='ih*(${z})':eval=frame:flags=spline36,` +
+        // 2) shimmer azalt
+        `format=yuv420p,` +
+        blurPart +
+        // 3) dynamic scale (eval=frame)
+        `scale=w='iw*(${z})':h='ih*(${z})':eval=frame,` +
         `crop=${W}:${H}:x='${x}':y='${y}',` +
-        `fps=${fps},` +
-        `format=yuv420p,setsar=1,setpts=PTS-STARTPTS[v${i}]`
+        `fps=${fps},setsar=1,setpts=PTS-STARTPTS[v${i}]`
     );
   }
 
-  // concat
   const concatIns = Array.from({ length: bgCount }, (_, i) => `[v${i}]`).join("");
   parts.push(`${concatIns}concat=n=${bgCount}:v=1:a=0[vbg]`);
 
   let vOut = "[vbg]";
 
-  // CTA overlay (baş + son)
   if (ctaEnabled) {
     const ctaIndex = bgCount;
     const ctaMaxW = Math.min(900, Math.round(W * 0.7));
 
-    parts.push(`[${ctaIndex}:v]scale=w='min(iw,${ctaMaxW})':h=-1:flags=spline36,format=rgba[cta]`);
+    // ✅ spline36 yok! (bicubic default)
+    parts.push(`[${ctaIndex}:v]scale=w='min(iw,${ctaMaxW})':h=-1,format=rgba[cta]`);
 
     const startFrom = 0;
     const startTo = Math.min(total, ctaStartDur);
